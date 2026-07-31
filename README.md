@@ -19,8 +19,8 @@
 
 请从 [Releases](../../releases/latest) 下载当前版本：
 
-- macOS Apple Silicon：`豆包账号池接口服务-0.1.11-arm64.dmg`
-- Windows x64：`豆包账号池接口服务-0.1.11-win-x64.exe`
+- macOS Apple Silicon：`Doubao-Account-Pool-0.1.11-macOS-arm64.dmg`
+- Windows x64：`Doubao-Account-Pool-0.1.11-Windows-x64.exe`
 
 当前安装包未使用商业代码签名证书。macOS Gatekeeper 或 Windows SmartScreen 首次运行时可能显示安全提示，请核对发布页中的 SHA-256 后再安装。
 
