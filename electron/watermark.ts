@@ -11,9 +11,24 @@ const VIDEO_URL_KEYS = [
 ];
 
 const UNSUPPORTED_RE = /平台暂不支持|暂不支持|不支持该平台|unsupported platform|not supported/i;
-const RETRY_DELAYS_MS = [0, 3000, 8000, 15000];
+const RETRY_DELAYS_MS = [0, 5000, 10000, 20000, 30000, 45000, 60000];
+const REQUEST_TIMEOUT_MS = 20000;
 
-export async function resolveCleanVideoUrl(settings: AppSettings, shareUrl: string) {
+export interface WatermarkRetryInfo {
+  failedAttempt: number;
+  nextAttempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  error: string;
+}
+
+type WatermarkRetryCallback = (info: WatermarkRetryInfo) => void | Promise<void>;
+
+export async function resolveCleanVideoUrl(
+  settings: AppSettings,
+  shareUrl: string,
+  onRetry?: WatermarkRetryCallback
+) {
   if (!settings.watermarkApiToken.trim()) {
     throw new Error("未配置去水印 Token，无法返回可用视频");
   }
@@ -30,6 +45,13 @@ export async function resolveCleanVideoUrl(settings: AppSettings, shareUrl: stri
       if (!isRetryableWatermarkError(error) || attempt === RETRY_DELAYS_MS.length - 1) {
         throw error;
       }
+      await onRetry?.({
+        failedAttempt: attempt + 1,
+        nextAttempt: attempt + 2,
+        maxAttempts: RETRY_DELAYS_MS.length,
+        delayMs: RETRY_DELAYS_MS[attempt + 1],
+        error: errorMessage(error)
+      });
     }
   }
 
@@ -39,7 +61,8 @@ export async function resolveCleanVideoUrl(settings: AppSettings, shareUrl: stri
 async function resolveCleanVideoUrlOnce(settings: AppSettings, shareUrl: string) {
   const apiUrl = `${settings.watermarkApiUrl}?url=${encodeURIComponent(shareUrl)}`;
   const upstream = await fetch(apiUrl, {
-    headers: { Authorization: settings.watermarkApiToken }
+    headers: { Authorization: settings.watermarkApiToken },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
   const text = await upstream.text();
   if (!upstream.ok) {
@@ -69,10 +92,10 @@ async function resolveCleanVideoUrlOnce(settings: AppSettings, shareUrl: string)
   return cleanVideoUrl;
 }
 
-function isRetryableWatermarkError(error: unknown) {
+export function isRetryableWatermarkError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   if (UNSUPPORTED_RE.test(message)) return false;
-  return /未找到资源|获取失败|没有返回 MP4|HTTP (?:404|408|409|425|429|5\d\d)|无法访问|不是可播放视频|fetch failed|network|timeout/i.test(message);
+  return /未找到资源|资源未就绪|处理中|稍后重试|解析失败|获取失败|没有返回 MP4|HTTP (?:404|408|409|425|429|5\d\d)|无法访问|不是可播放视频|fetch failed|network|timeout|aborted/i.test(message);
 }
 
 export function extractVideoUrlFromPayload(value: unknown): string | null {
@@ -112,7 +135,8 @@ export async function verifyPlayableVideoUrl(url: string) {
   try {
     response = await fetch(url, {
       headers: { Range: "bytes=0-1023" },
-      redirect: "follow"
+      redirect: "follow",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
   } catch (error) {
     throw new Error(`去水印视频地址无法访问：${errorMessage(error)}`);

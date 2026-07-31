@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { BrowserWindow, clipboard } from "electron";
 import type { AppDatabase } from "./database.js";
+import { AccountTaskScheduler } from "./account-scheduler.js";
 import { toPublicApiRequest } from "./public-api.js";
 import type { Account, ApiRequest, AppSettings, DoubaoModel } from "./types.js";
 import { resolveCleanVideoUrl } from "./watermark.js";
@@ -9,46 +10,50 @@ import { resolveCleanVideoUrl } from "./watermark.js";
 const DOUBAO_THREAD_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/thread\/[A-Za-z0-9_-]+(?:\?[^\s"'<>]*)?/i;
 
 type DataChangedCallback = () => void;
-type QueueItem = { requestId: string; mode: "generate" | "recover" };
+type QueueItem = {
+  key: string;
+  requestId: string;
+  accountId: number;
+  mode: "generate" | "recover";
+};
 
 export class DoubaoExecutor {
-  private readonly queue: QueueItem[] = [];
-  private running = false;
+  private readonly scheduler: AccountTaskScheduler<QueueItem>;
 
   constructor(
     private readonly database: AppDatabase,
     private readonly onDataChanged: DataChangedCallback
-  ) {}
-
-  enqueue(requestId: string) {
-    if (!this.queue.some((item) => item.requestId === requestId)) {
-      this.queue.push({ requestId, mode: "generate" });
-    }
-    void this.drain();
-  }
-
-  enqueueRecovery(requestId: string) {
-    if (!this.queue.some((item) => item.requestId === requestId)) {
-      this.queue.push({ requestId, mode: "recover" });
-    }
-    void this.drain();
-  }
-
-  private async drain() {
-    if (this.running) return;
-    this.running = true;
-    try {
-      while (this.queue.length) {
-        const item = this.queue.shift()!;
+  ) {
+    this.scheduler = new AccountTaskScheduler(
+      () => this.database.getSettings().maxConcurrentAccounts,
+      async (item) => {
         if (item.mode === "recover") {
           await this.recoverResult(item.requestId);
         } else {
           await this.execute(item.requestId);
         }
-      }
-    } finally {
-      this.running = false;
-    }
+      },
+      (error) => console.error("豆包并行执行器异常", error)
+    );
+  }
+
+  enqueue(requestId: string) {
+    this.enqueueItem(requestId, "generate");
+  }
+
+  enqueueRecovery(requestId: string) {
+    this.enqueueItem(requestId, "recover");
+  }
+
+  private enqueueItem(requestId: string, mode: QueueItem["mode"]) {
+    const request = this.database.getApiRequest(requestId);
+    if (!request?.accountId) return false;
+    return this.scheduler.enqueue({
+      key: requestId,
+      requestId,
+      accountId: request.accountId,
+      mode
+    });
   }
 
   private async recoverResult(requestId: string) {
@@ -82,7 +87,7 @@ export class DoubaoExecutor {
         throw new Error("未在该账号最近对话中找到匹配的已生成视频，或仍未复制到分享链接");
       }
 
-      const cleanVideoUrl = await resolveCleanVideoUrl(settings, shareUrl);
+      const cleanVideoUrl = await this.resolveCleanVideoWithProgress(requestId, settings, shareUrl);
       const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
       await this.updateProgress({
         requestId,
@@ -200,7 +205,7 @@ export class DoubaoExecutor {
         throw new Error("接口仅返回去水印视频，本次请求未启用去水印");
       }
 
-      const cleanVideoUrl = await resolveCleanVideoUrl(settings, doubaoThreadUrl);
+      const cleanVideoUrl = await this.resolveCleanVideoWithProgress(requestId, settings, doubaoThreadUrl);
       const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
 
       await this.updateProgress({
@@ -240,6 +245,21 @@ export class DoubaoExecutor {
     this.onDataChanged();
     await postCallback(updated);
     return updated;
+  }
+
+  private resolveCleanVideoWithProgress(
+    requestId: string,
+    settings: AppSettings,
+    shareUrl: string
+  ) {
+    return resolveCleanVideoUrl(settings, shareUrl, async (retry) => {
+      const delaySeconds = Math.ceil(retry.delayMs / 1000);
+      await this.updateProgress({
+        requestId,
+        status: "running",
+        message: `去水印资源尚未就绪，${delaySeconds} 秒后进行第 ${retry.nextAttempt}/${retry.maxAttempts} 次解析：${retry.error}`
+      });
+    });
   }
 
   private async failRequest(request: ApiRequest, message: string, refunded: boolean) {

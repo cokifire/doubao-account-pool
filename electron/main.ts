@@ -145,7 +145,9 @@ class LocalApiServer {
         }
 
         const referenceImagePath = await prepareReferenceImage(body, requestId);
-        const account = this.database.findAvailableAccount(model);
+        const account = settings.executorEnabled
+          ? this.database.reserveAvailableAccount(model)
+          : this.database.findAvailableAccount(model);
         const cost = model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
 
         if (!account) {

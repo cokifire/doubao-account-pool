@@ -31,7 +31,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   fastCost: 3,
   dailyResetTime: "00:00",
   generationTimeoutSeconds: 900,
-  maxConcurrentAccounts: 1,
+  maxConcurrentAccounts: 4,
   retryCount: 1,
   autoRemoveWatermark: true,
   watermarkApiUrl: "https://nologo.code24.top/api/water-mask/parse",
@@ -99,6 +99,7 @@ export class AppDatabase {
     this.ensureApiRequestColumns();
     this.cleanInvalidSuccessfulResults();
     this.ensureDefaultSettings();
+    this.migrateExecutorConcurrency();
   }
 
   listAccounts(): Account[] {
@@ -276,6 +277,15 @@ export class AppDatabase {
         id ASC
       LIMIT 1
     `).get(requiredQuota) as Account | undefined;
+  }
+
+  reserveAvailableAccount(model: DoubaoModel): Account | undefined {
+    return this.db.transaction(() => {
+      const account = this.findAvailableAccount(model);
+      if (!account) return undefined;
+      this.markAccountAllocated(account.id, "busy");
+      return this.getAccount(account.id);
+    })();
   }
 
   deductQuota(accountId: number, model: DoubaoModel): Account {
@@ -510,6 +520,21 @@ export class AppDatabase {
     if (existingCount.count === 0) {
       this.updateSettings(DEFAULT_SETTINGS);
     }
+  }
+
+  private migrateExecutorConcurrency() {
+    const migrationKey = "executorConcurrencyV1";
+    const migrated = this.db.prepare("SELECT 1 FROM settings WHERE key = ?").get(migrationKey);
+    if (migrated) return;
+
+    const timestamp = now();
+    this.db.prepare(`
+      UPDATE settings
+      SET value = '4', updated_at = ?
+      WHERE key = 'maxConcurrentAccounts' AND CAST(value AS INTEGER) = 1
+    `).run(timestamp);
+    this.db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, 'true', ?)")
+      .run(migrationKey, timestamp);
   }
 
   private ensureAccountColumns() {

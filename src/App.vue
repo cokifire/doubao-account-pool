@@ -55,7 +55,7 @@ const settingsForm = reactive<AppSettings>({
   fastCost: 3,
   dailyResetTime: "00:00",
   generationTimeoutSeconds: 900,
-  maxConcurrentAccounts: 1,
+  maxConcurrentAccounts: 4,
   retryCount: 1,
   autoRemoveWatermark: true,
   watermarkApiUrl: "https://nologo.code24.top/api/water-mask/parse",
@@ -724,7 +724,7 @@ onBeforeUnmount(() => {
             <input v-model.number="settingsForm.generationTimeoutSeconds" type="number" min="60" />
           </label>
           <label>
-            <span>最大并发账号数</span>
+            <span>最大并发账号数（不同账号同时执行）</span>
             <input v-model.number="settingsForm.maxConcurrentAccounts" type="number" min="1" />
           </label>
           <label>

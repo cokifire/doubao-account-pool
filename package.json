@@ -1,6 +1,6 @@
 {
   "name": "doubao-account-manager",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "豆包多账号隔离登录、额度调度和本地视频生成接口服务",
   "main": "dist-electron/main.js",
   "type": "module",
@@ -11,6 +11,8 @@
     "build": "vue-tsc --noEmit && vite build && tsc -p tsconfig.electron.json",
     "dist": "npm run build && electron-builder",
     "dist:win": "npm run build && electron-builder --win nsis --x64",
+    "test:unit": "npm run build && node --test tests/*.test.mjs",
+    "test:watermark": "npm run build && node --test tests/watermark.test.mjs",
     "verify:mac": "codesign --verify --deep --strict --verbose=4 'release/mac-arm64/豆包账号池接口服务.app'",
     "typecheck": "vue-tsc --noEmit && tsc -p tsconfig.electron.json --noEmit"
   },

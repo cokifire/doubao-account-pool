@@ -17,6 +17,10 @@ module.exports = async (context) => {
     app: appPath,
     identity: '-',
     identityValidation: false,
+    optionsForFile: () => ({
+      hardenedRuntime: false,
+      timestamp: 'none',
+    }),
     platform: 'darwin',
   })
 }
