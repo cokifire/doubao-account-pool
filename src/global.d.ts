@@ -1,0 +1,44 @@
+import type {
+  Account,
+  AccountUpdateInput,
+  ApiRequest,
+  ApiServerStatus,
+  AppSettings,
+  AppSettingsUpdateInput
+} from "../electron/types";
+
+declare global {
+  interface Window {
+    doubaoManager: {
+      accounts: {
+        list: () => Promise<Account[]>;
+        create: (remark?: string) => Promise<Account>;
+        update: (input: AccountUpdateInput) => Promise<Account>;
+        delete: (id: number) => Promise<boolean>;
+        open: (id: number) => Promise<void>;
+        relogin: (id: number) => Promise<boolean>;
+        detectLogin: (id: number) => Promise<Account>;
+        detectAll: () => Promise<Account[]>;
+        resetQuota: (id: number) => Promise<Account>;
+        resetAllQuotas: () => Promise<Account[]>;
+      };
+      settings: {
+        get: () => Promise<AppSettings>;
+        update: (input: AppSettingsUpdateInput) => Promise<AppSettings>;
+      };
+      apiServer: {
+        status: () => Promise<ApiServerStatus>;
+        restart: () => Promise<ApiServerStatus>;
+      };
+      apiRequests: {
+        list: (limit?: number) => Promise<ApiRequest[]>;
+        clear: () => Promise<boolean>;
+      };
+      events: {
+        onDataChanged: (callback: () => void) => () => void;
+      };
+    };
+  }
+}
+
+export {};
