@@ -3,6 +3,12 @@ import path from "node:path";
 import { BrowserWindow, clipboard } from "electron";
 import type { AppDatabase } from "./database.js";
 import { AccountTaskScheduler } from "./account-scheduler.js";
+import {
+  extractDoubaoFailureMessage,
+  hasNewTextOccurrence,
+  isQuotaNotChargedFailure,
+  normalizeComparableText
+} from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
 import type { Account, ApiRequest, AppSettings, DoubaoModel } from "./types.js";
 import { resolveCleanVideoUrl } from "./watermark.js";
@@ -16,6 +22,13 @@ type QueueItem = {
   accountId: number;
   mode: "generate" | "recover";
 };
+
+class DoubaoPageFailureError extends Error {
+  constructor(message: string, readonly refundQuota: boolean) {
+    super(message);
+    this.name = "DoubaoPageFailureError";
+  }
+}
 
 export class DoubaoExecutor {
   private readonly scheduler: AccountTaskScheduler<QueueItem>;
@@ -192,7 +205,8 @@ export class DoubaoExecutor {
         message: "已提交豆包，等待视频完成并复制分享链接"
       });
 
-      const generationResult = await waitForGenerationResult(win, settings.generationTimeoutSeconds, async (message) => {
+      const generationBaselineText = await getPageText(win);
+      const generationResult = await waitForGenerationResult(win, settings.generationTimeoutSeconds, generationBaselineText, async (message) => {
         await this.updateProgress({ requestId, status: "running", message });
       });
 
@@ -225,13 +239,14 @@ export class DoubaoExecutor {
         win.close();
       }
     } catch (error) {
-      if (!submittedToDoubao) {
+      const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(error);
+      if (shouldRefundQuota) {
         this.database.refundQuota(account.id, request.model);
       }
-      await this.failRequest(request, errorMessage(error), !submittedToDoubao);
+      await this.failRequest(request, errorMessage(error), shouldRefundQuota);
       this.database.updateAccount({
         id: account.id,
-        currentStatus: submittedToDoubao ? "error" : "idle"
+        currentStatus: keepWindowOpen ? "login_required" : submittedToDoubao && !shouldRefundQuota ? "error" : "idle"
       });
       this.onDataChanged();
       if (win && !settings.showExecutorWindow && !keepWindowOpen && !win.isDestroyed()) {
@@ -371,7 +386,60 @@ async function setFirstFileInput(win: BrowserWindow, filePath: string) {
 }
 
 async function fillPrompt(win: BrowserWindow, prompt: string) {
-  const target = await runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+  const target = await findComposerTarget(win);
+
+  if (!target) {
+    throw new Error("没有找到豆包提示词输入框");
+  }
+
+  const attempts: Array<{ label: string; run: () => Promise<void> }> = [
+    {
+      label: "insertText",
+      run: async () => {
+        await sendMouseClick(win, target.x, target.y);
+        await sendKeyboard(win, "A", ["meta"], 100);
+        await sendKeyboard(win, "Backspace", undefined, 100);
+        await win.webContents.insertText(prompt);
+        await wait(900);
+      }
+    },
+    {
+      label: "clipboardPaste",
+      run: async () => {
+        const before = clipboard.readText();
+        clipboard.writeText(prompt);
+        await sendMouseClick(win, target.x, target.y);
+        await sendKeyboard(win, "A", ["meta"], 100);
+        await sendKeyboard(win, "Backspace", undefined, 100);
+        await sendKeyboard(win, "V", ["meta"], 900);
+        if (clipboard.readText() === prompt) {
+          clipboard.writeText(before);
+        }
+      }
+    },
+    {
+      label: "domInput",
+      run: async () => {
+        await setComposerTextDirectly(win, prompt);
+        await wait(900);
+      }
+    }
+  ];
+
+  const tried: string[] = [];
+  for (const attempt of attempts) {
+    tried.push(attempt.label);
+    await attempt.run();
+    const diagnostics = await inspectComposer(win, prompt);
+    if (diagnostics.promptPresent) return;
+  }
+
+  const diagnostics = await inspectComposer(win, prompt);
+  throw new Error(`豆包输入框没有真正接收本次提示词（已尝试 ${tried.join("、")}；${formatComposerDiagnostics(diagnostics)}）`);
+}
+
+async function findComposerTarget(win: BrowserWindow) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
     (() => {
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
@@ -405,21 +473,47 @@ async function fillPrompt(win: BrowserWindow, prompt: string) {
       };
     })()
   `);
+}
 
-  if (!target) {
-    throw new Error("没有找到豆包提示词输入框");
-  }
+async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const prompt = ${JSON.stringify(prompt)};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 20 && rect.height > 20 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const editableSelector = 'textarea, [contenteditable="true"], [role="textbox"], input[type="text"]';
+      const editables = Array.from(document.querySelectorAll(editableSelector))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+        .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const editor = editables[0];
+      if (!editor) return false;
 
-  await sendMouseClick(win, target.x, target.y);
-  await sendKeyboard(win, "A", ["meta"], 100);
-  await sendKeyboard(win, "Backspace", undefined, 100);
-  await win.webContents.insertText(prompt);
-  await wait(900);
+      editor.focus();
+      if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
+        const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), "value")?.set;
+        setter?.call(editor, prompt);
+      } else {
+        editor.textContent = prompt;
+      }
 
-  const diagnostics = await inspectComposer(win);
-  if (!diagnostics.promptPresent) {
-    throw new Error(`豆包输入框没有真正接收提示词（${formatComposerDiagnostics(diagnostics)}）`);
-  }
+      editor.dispatchEvent(new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: prompt
+      }));
+      editor.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: prompt
+      }));
+      editor.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()
+  `);
 }
 
 async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
@@ -433,6 +527,7 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
 }
 
 async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel) {
+  const baselineText = await getPageText(win);
   const attempts: Array<{ label: string; run: () => Promise<boolean> }> = [
     {
       label: "Enter",
@@ -475,7 +570,14 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel) {
     const didRun = await attempt.run();
     if (!didRun) continue;
     tried.push(attempt.label);
-    if (await waitForSubmissionStarted(win, model, 5000)) return;
+    const result = await waitForSubmissionStarted(win, model, baselineText, 5000);
+    if (result.confirmed) return;
+    if (result.failureMessage) {
+      throw new DoubaoPageFailureError(
+        `豆包提交后返回失败：${result.failureMessage}`,
+        isQuotaNotChargedFailure(result.failureMessage)
+      );
+    }
   }
 
   const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
@@ -497,7 +599,7 @@ async function sendKeyboard(
   await wait(settleMs);
 }
 
-async function inspectComposer(win: BrowserWindow) {
+async function inspectComposer(win: BrowserWindow, expectedPrompt = "") {
   return runPageScript<{
     promptPresent: boolean;
     textLength: number;
@@ -506,6 +608,12 @@ async function inspectComposer(win: BrowserWindow) {
     enabledSendCandidates: number;
   }>(win, `
     (() => {
+      const expectedPrompt = ${JSON.stringify(expectedPrompt)};
+      const normalizeComparableText = (value) => value.replace(/[^\\p{L}\\p{N}]+/gu, "").trim();
+      const expectedSignature = (() => {
+        const normalized = normalizeComparableText(expectedPrompt);
+        return normalized.slice(0, Math.min(42, Math.max(12, normalized.length)));
+      })();
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
@@ -531,8 +639,11 @@ async function inspectComposer(win: BrowserWindow) {
         ].filter(Boolean).join(" ")));
       const enabled = sendNodes.filter((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true");
       const normalizedText = editorText.replace(/\\s+/g, "").trim();
+      const comparableText = normalizeComparableText(editorText);
       return {
-        promptPresent: normalizedText.length > 0,
+        promptPresent: expectedSignature
+          ? comparableText.includes(expectedSignature)
+          : normalizedText.length > 0,
         textLength: normalizedText.length,
         activeElement: active
           ? active.tagName.toLowerCase() + (active.getAttribute("role") ? "[role=" + active.getAttribute("role") + "]" : "")
@@ -611,36 +722,53 @@ async function sendMouseClick(win: BrowserWindow, x: number, y: number) {
   win.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
 }
 
-async function waitForSubmissionStarted(win: BrowserWindow, model: DoubaoModel, timeoutMs = 15000) {
+async function waitForSubmissionStarted(
+  win: BrowserWindow,
+  model: DoubaoModel,
+  baselineText: string,
+  timeoutMs = 15000
+) {
   const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const state = await runPageScript<{ confirmed: boolean; pageTextExcerpt: string }>(win, `
+    const state = await runPageScript<{ confirmed: boolean; failureMessage: string | null; pageTextExcerpt: string }>(win, `
       (() => {
         const modelLabel = ${JSON.stringify(modelLabel)};
+        const baselineText = ${JSON.stringify(baselineText)};
+        const extractDoubaoFailureMessage = ${extractDoubaoFailureMessage.toString()};
+        const hasNewTextOccurrence = ${hasNewTextOccurrence.toString()};
         const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
         const expected = "本次使用 " + modelLabel + " 生成";
+        const failureMessage = extractDoubaoFailureMessage(pageText);
         return {
-          confirmed: pageText.includes(expected)
+          confirmed: hasNewTextOccurrence(pageText, baselineText, expected)
             && pageText.includes("视频生成好后")
             && pageText.includes("本次生成将消耗每日免费额度"),
+          failureMessage: failureMessage && hasNewTextOccurrence(pageText, baselineText, failureMessage)
+            ? failureMessage
+            : null,
           pageTextExcerpt: pageText.slice(-500)
         };
       })()
     `);
 
     if (state.confirmed) {
-      return true;
+      return { confirmed: true, failureMessage: null };
+    }
+    if (state.failureMessage) {
+      return { confirmed: false, failureMessage: state.failureMessage };
     }
     await wait(1000);
   }
 
-  return false;
+  return { confirmed: false, failureMessage: null };
 }
 
 interface GenerationPageState {
   generated: boolean;
   failed: boolean;
+  failureMessage: string | null;
+  pageText: string;
   directVideoUrl: string | null;
   visibleVideoCount: number;
 }
@@ -653,6 +781,7 @@ interface GenerationResult {
 async function waitForGenerationResult(
   win: BrowserWindow,
   timeoutSeconds: number,
+  baselineText: string,
   onProgress: (message: string) => Promise<void> | void
 ): Promise<GenerationResult> {
   const timeoutMs = Math.max(60, timeoutSeconds || 900) * 1000;
@@ -663,8 +792,15 @@ async function waitForGenerationResult(
 
   while (Date.now() - startedAt < timeoutMs) {
     const pageState = await inspectGenerationPage(win);
-    if (pageState.failed) {
-      throw new Error("豆包已返回视频生成失败");
+    const newFailureMessage = pageState.failureMessage
+      && hasNewTextOccurrence(pageState.pageText, baselineText, pageState.failureMessage)
+      ? pageState.failureMessage
+      : null;
+    if (newFailureMessage) {
+      throw new DoubaoPageFailureError(
+        `豆包已返回视频生成失败：${newFailureMessage}`,
+        isQuotaNotChargedFailure(newFailureMessage)
+      );
     }
 
     if (pageState.generated) {
@@ -710,6 +846,7 @@ async function inspectGenerationPage(win: BrowserWindow) {
         return rect.width > 20 && rect.height > 20 && style.visibility !== "hidden" && style.display !== "none";
       };
       const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
+      const extractDoubaoFailureMessage = ${extractDoubaoFailureMessage.toString()};
       const videos = Array.from(document.querySelectorAll("video")).filter(visible);
       const videoUrls = videos.flatMap((video) => [
         video.currentSrc,
@@ -718,9 +855,12 @@ async function inspectGenerationPage(win: BrowserWindow) {
       ]).filter((value) => /^https?:\\/\\//i.test(value || ""));
       const completedByText = /你的视频生成好[了啦]|视频已生成|视频生成完成|生成视频已完成/.test(pageText);
       const playableVideo = videos.some((video) => Boolean(video.currentSrc || video.src || video.poster || video.readyState >= 1));
+      const failureMessage = extractDoubaoFailureMessage(pageText);
       return {
         generated: completedByText || playableVideo,
-        failed: /视频生成失败|生成视频失败|未能生成视频/.test(pageText),
+        failed: Boolean(failureMessage),
+        failureMessage,
+        pageText,
         directVideoUrl: videoUrls[videoUrls.length - 1] || null,
         visibleVideoCount: videos.length
       };
@@ -755,10 +895,6 @@ async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt:
   }
 
   return null;
-}
-
-function normalizeComparableText(value: string) {
-  return value.replace(/[^\p{L}\p{N}]+/gu, "").trim();
 }
 
 async function tryCopyShareLink(win: BrowserWindow) {
@@ -1026,6 +1162,10 @@ async function runPageScript<T>(win: BrowserWindow, script: string) {
   return win.webContents.executeJavaScript(script, true) as Promise<T>;
 }
 
+async function getPageText(win: BrowserWindow) {
+  return runPageScript<string>(win, `(document.body?.innerText || "").replace(/\\s+/g, " ").trim()`);
+}
+
 function extractDoubaoShareUrl(value: string | null | undefined) {
   if (!value) return null;
   const matched = value.match(DOUBAO_THREAD_URL_RE)?.[0];
@@ -1034,6 +1174,10 @@ function extractDoubaoShareUrl(value: string | null | undefined) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "执行器未知错误";
+}
+
+function isRefundableExecutionError(error: unknown) {
+  return error instanceof DoubaoPageFailureError && error.refundQuota;
 }
 
 function wait(ms: number) {
