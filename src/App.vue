@@ -16,6 +16,7 @@ type TabKey = "accounts" | "settings" | "logs";
 const accounts = ref<Account[]>([]);
 const apiRequests = ref<ApiRequest[]>([]);
 const apiStatus = ref<ApiServerStatus>({
+  version: "0.1.18",
   enabled: false,
   running: false,
   port: 0,
@@ -183,8 +184,15 @@ const watermarkExample = computed(() => {
 });
 
 let removeDataChangedListener: (() => void) | null = null;
+let refreshTimer: number | null = null;
+let statusCheckTimer: number | null = null;
+let refreshInFlight = false;
+let statusCheckInFlight = false;
 
 async function refresh() {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  try {
   const [accountRows, settings, status, requests] = await Promise.all([
     window.doubaoManager.accounts.list(),
     window.doubaoManager.settings.get(),
@@ -195,6 +203,20 @@ async function refresh() {
   apiRequests.value = requests;
   apiStatus.value = status;
   Object.assign(settingsForm, settings);
+  } finally {
+    refreshInFlight = false;
+  }
+}
+
+async function autoCheckAccountStatuses() {
+  if (statusCheckInFlight) return;
+  statusCheckInFlight = true;
+  try {
+    await window.doubaoManager.accounts.detectAll();
+    await refresh();
+  } finally {
+    statusCheckInFlight = false;
+  }
 }
 
 async function addAccountAndOpen() {
@@ -457,14 +479,25 @@ onMounted(async () => {
   });
   try {
     await refresh();
+    await autoCheckAccountStatuses();
+  } catch (error) {
+    console.error("初始化账号状态检查失败", error);
   } finally {
     loading.value = false;
   }
+  refreshTimer = window.setInterval(() => {
+    void refresh().catch((error) => console.error("自动刷新接口状态失败", error));
+  }, 3000);
+  statusCheckTimer = window.setInterval(() => {
+    void autoCheckAccountStatuses().catch((error) => console.error("自动检测账号状态失败", error));
+  }, 30000);
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("click", closeMenus);
   removeDataChangedListener?.();
+  if (refreshTimer !== null) window.clearInterval(refreshTimer);
+  if (statusCheckTimer !== null) window.clearInterval(statusCheckTimer);
 });
 </script>
 
@@ -478,6 +511,7 @@ onBeforeUnmount(() => {
       <div class="api-status-compact" :class="{ running: apiStatus.running, error: !apiStatus.running }">
         <span class="status-dot" aria-hidden="true"></span>
         <strong>{{ apiStatus.running ? "API 正常" : "API 异常" }}</strong>
+        <span class="app-version">v{{ apiStatus.version }}</span>
         <span>{{ apiDisplayAddress() }}</span>
         <button v-if="apiStatus.url" type="button" @click="copyApiAddress">
           {{ apiAddressCopied ? "已复制" : "复制地址" }}

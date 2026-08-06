@@ -103,6 +103,7 @@ export interface ApiRequestUpdateInput {
 }
 
 export interface ApiServerStatus {
+  version: string;
   enabled: boolean;
   running: boolean;
   port: number;

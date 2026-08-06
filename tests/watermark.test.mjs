@@ -5,6 +5,7 @@ import {
   extractVideoUrlFromPayload,
   isMp4VideoUrl,
   isRetryableWatermarkError,
+  WATERMARK_RETRY_DELAYS_MS,
 } from '../dist-electron/watermark.js'
 
 test('extracts a nested MP4 result', () => {
@@ -25,4 +26,8 @@ test('retries eventual-consistency failures from the watermark provider', () => 
 
 test('does not retry unsupported platforms', () => {
   assert.equal(isRetryableWatermarkError(new Error('去水印接口返回：平台暂不支持')), false)
+})
+
+test('uses a short first retry and bounded backoff', () => {
+  assert.deepEqual([...WATERMARK_RETRY_DELAYS_MS], [0, 2500, 6000, 12000, 20000, 30000])
 })

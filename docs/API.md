@@ -3,6 +3,7 @@
 ## 基础信息
 
 - 默认地址：`http://127.0.0.1:17888`
+- 当前接口版本：`0.1.24`
 - 默认认证：`Authorization: Bearer local-doubao-key`
 - 除 `/health` 外，其余接口均需要 Bearer Token。
 - 建议在“配置管理”中修改默认 API Key。
@@ -82,10 +83,11 @@ Content-Type: application/json
 
 成功时返回经过验证的 `cleanVideoUrl`；失败时返回 HTTP 422 和 `status: "failed"`。
 
+去水印服务存在短暂的资源准备延迟。程序会先验证返回地址确实是可播放 MP4，未就绪时使用短间隔重试；重试状态会按任务顺序异步通知回调，不会阻塞视频结果解析。
+
 ## 成功语义
 
 外部接口不会把豆包分享页、聊天页或 thread 页面地址当作视频结果。只有满足以下任一条件才返回 `status: "success"`：
 
 - `cleanVideoUrl` 是经过验证、可访问的 MP4 视频地址。
 - `outputVideoPath` 是已经保存成功的本地 `.mp4` 文件路径。
-

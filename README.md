@@ -2,6 +2,8 @@
 
 豆包账号池是一款基于 Electron 的本地桌面工具，用于管理多个相互隔离的豆包登录环境，并通过本地 HTTP API 为无限画布或其他工作流提供视频生成能力。
 
+当前版本：`0.1.24`
+
 ## 主要功能
 
 - 多账号隔离：每个账号使用固定的 Electron `persist:` partition，Cookie、LocalStorage、缓存和登录状态互不混用。
@@ -10,17 +12,18 @@
 - 账号池调度：自动选择已登录、空闲且额度充足的账号执行请求。
 - 后台视频生成：支持文本提示词和参考图片，跟踪等待、执行、成功和失败状态。
 - 严格结果输出：只有取得经过验证的真实 MP4 地址或本地 MP4 文件后，任务才会返回 `success`。
-- 可选去水印：可配置第三方解析接口；解析失败或未取得 MP4 时返回 `failed`。
+- 可选去水印：可配置第三方解析接口；只在取得并验证 MP4 后返回 `success`，解析失败或未取得 MP4 时返回 `failed`。
 - 本地接口服务：默认监听 `127.0.0.1:17888`，支持 API Key、状态查询和回调地址。
 - 可观测界面：提供账号概览、剩余额度、Mini/Fast 预计产能、搜索筛选和接口日志详情。
+- 结果恢复与诊断：支持从账号最近对话恢复已生成视频，日志显示分享复制、去水印重试和耗时信息。
 - 跨平台安装包：提供 macOS Apple Silicon DMG 和 Windows x64 EXE。
 
 ## 下载与安装
 
 请从 [Releases](../../releases/latest) 下载当前版本：
 
-- macOS Apple Silicon：`Doubao-Account-Pool-0.1.14-macOS-arm64.dmg`
-- Windows x64：`Doubao-Account-Pool-0.1.14-Windows-x64.exe`
+- macOS Apple Silicon：`豆包账号池接口服务-0.1.24-arm64.dmg`
+- Windows x64：`豆包账号池接口服务-0.1.24-win-x64.exe`
 
 macOS 应用已进行完整 ad-hoc 签名，避免因 Electron 临时签名不完整而显示“应用已损坏”。当前安装包尚未使用 Apple Developer ID 公证或 Windows 商业代码签名，Gatekeeper 或 SmartScreen 首次运行时仍可能显示来源提示。请核对发布页中的 SHA-256；macOS 首次尝试打开后，可进入“系统设置 > 隐私与安全性”，在安全性区域选择“仍要打开”。
 
@@ -58,7 +61,7 @@ curl http://127.0.0.1:17888/api/requests/doubao-xxxxxxxxxxxxxxxx \
 {
   "requestId": "doubao-xxxxxxxxxxxxxxxx",
   "status": "success",
-  "message": "视频生成完成，去水印 MP4 地址已验证",
+  "message": "视频生成完成，去水印 MP4 地址已验证（耗时 X 秒，第 N 次解析）",
   "model": "seedance_2_0_mini",
   "cleanVideoUrl": "https://example.com/video.mp4",
   "outputVideoPath": null

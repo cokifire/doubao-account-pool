@@ -2,6 +2,14 @@ export function normalizeComparableText(value: string) {
   return value.replace(/[^\p{L}\p{N}]+/gu, "").trim();
 }
 
+const DOUBAO_SHARE_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/(?:thread|chat|share)\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
+
+export function extractDoubaoShareUrl(value: string | null | undefined) {
+  if (!value) return null;
+  const matched = value.match(DOUBAO_SHARE_URL_RE)?.[0];
+  return matched?.replace(/[)\]}>，。！？；;]+$/, "") || null;
+}
+
 export function promptSignature(prompt: string) {
   const normalized = normalizeComparableText(prompt);
   return normalized.slice(0, Math.min(42, Math.max(12, normalized.length)));
@@ -10,6 +18,30 @@ export function promptSignature(prompt: string) {
 export function containsPromptSignature(value: string, prompt: string) {
   const signature = promptSignature(prompt);
   return signature.length > 0 && normalizeComparableText(value).includes(signature);
+}
+
+export function isDoubaoPromptRewritePage(pageText: string) {
+  const text = pageText.replace(/\s+/g, " ").trim();
+  return /完整\s*\d+(?:\.\d+)?\s*秒视频生成指令|可直接用于(?:AI\s*)?视频生成工具|要不要我再精简一版提示词/.test(text);
+}
+
+export function isDoubaoGenerationComplete(pageText: string) {
+  const text = pageText.replace(/\s+/g, " ").trim();
+  return /你的视频(?:已经|已)?生成好[了啦]|视频(?:已经|已)?生成(?:完成|成功|好[了啦])|生成视频(?:已经|已)?完成/.test(text);
+}
+
+const GENERATION_COMPLETE_PATTERNS = [
+  /你的视频(?:已经|已)?生成好[了啦]/g,
+  /视频(?:已经|已)?生成(?:完成|成功|好[了啦])/g,
+  /生成视频(?:已经|已)?完成/g
+];
+
+export function hasNewGenerationCompletion(currentText: string, baselineText: string) {
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
+  const countMatches = (value: string, pattern: RegExp) => value.match(new RegExp(pattern.source, "g"))?.length || 0;
+  const current = normalize(currentText);
+  const baseline = normalize(baselineText);
+  return GENERATION_COMPLETE_PATTERNS.some((pattern) => countMatches(current, pattern) > countMatches(baseline, pattern));
 }
 
 export function extractDoubaoFailureMessage(pageText: string) {
@@ -62,6 +94,26 @@ export function hasNewTextOccurrence(currentText: string, baselineText: string, 
     }
   };
   return count(currentText) > count(baselineText);
+}
+
+export function hasNewPromptOccurrence(currentText: string, baselineText: string, prompt: string) {
+  const normalize = (value: string) => value.replace(/[^\p{L}\p{N}]+/gu, "").trim();
+  const normalizedPrompt = normalize(prompt);
+  const signature = normalizedPrompt.slice(0, Math.min(42, Math.max(12, normalizedPrompt.length)));
+  if (!signature) return false;
+
+  const count = (text: string) => {
+    let occurrences = 0;
+    let index = 0;
+    while (true) {
+      index = text.indexOf(signature, index);
+      if (index === -1) return occurrences;
+      occurrences += 1;
+      index += signature.length;
+    }
+  };
+
+  return count(normalize(currentText)) > count(normalize(baselineText));
 }
 
 export function isQuotaNotChargedFailure(message: string) {

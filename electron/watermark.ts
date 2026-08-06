@@ -11,7 +11,9 @@ const VIDEO_URL_KEYS = [
 ];
 
 const UNSUPPORTED_RE = /平台暂不支持|暂不支持|不支持该平台|unsupported platform|not supported/i;
-const RETRY_DELAYS_MS = [0, 5000, 10000, 20000, 30000, 45000, 60000];
+// The provider may return before its clean MP4/CDN object is ready. Keep the
+// first retry short, then back off without making the normal path wait minutes.
+export const WATERMARK_RETRY_DELAYS_MS = [0, 2500, 6000, 12000, 20000, 30000] as const;
 const REQUEST_TIMEOUT_MS = 20000;
 
 export interface WatermarkRetryInfo {
@@ -20,6 +22,7 @@ export interface WatermarkRetryInfo {
   maxAttempts: number;
   delayMs: number;
   error: string;
+  elapsedMs: number;
 }
 
 type WatermarkRetryCallback = (info: WatermarkRetryInfo) => void | Promise<void>;
@@ -34,23 +37,25 @@ export async function resolveCleanVideoUrl(
   }
 
   let lastError: unknown;
-  for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt += 1) {
-    const delayMs = RETRY_DELAYS_MS[attempt];
+  const startedAt = Date.now();
+  for (let attempt = 0; attempt < WATERMARK_RETRY_DELAYS_MS.length; attempt += 1) {
+    const delayMs = WATERMARK_RETRY_DELAYS_MS[attempt];
     if (delayMs) await wait(delayMs);
 
     try {
       return await resolveCleanVideoUrlOnce(settings, shareUrl);
     } catch (error) {
       lastError = error;
-      if (!isRetryableWatermarkError(error) || attempt === RETRY_DELAYS_MS.length - 1) {
+      if (!isRetryableWatermarkError(error) || attempt === WATERMARK_RETRY_DELAYS_MS.length - 1) {
         throw error;
       }
       await onRetry?.({
         failedAttempt: attempt + 1,
         nextAttempt: attempt + 2,
-        maxAttempts: RETRY_DELAYS_MS.length,
-        delayMs: RETRY_DELAYS_MS[attempt + 1],
-        error: errorMessage(error)
+        maxAttempts: WATERMARK_RETRY_DELAYS_MS.length,
+        delayMs: WATERMARK_RETRY_DELAYS_MS[attempt + 1],
+        error: errorMessage(error),
+        elapsedMs: Date.now() - startedAt
       });
     }
   }

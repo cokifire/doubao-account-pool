@@ -5,15 +5,18 @@ import type { AppDatabase } from "./database.js";
 import { AccountTaskScheduler } from "./account-scheduler.js";
 import {
   extractDoubaoFailureMessage,
+  extractDoubaoShareUrl,
+  hasNewGenerationCompletion,
+  hasNewPromptOccurrence,
   hasNewTextOccurrence,
+  isDoubaoGenerationComplete,
+  isDoubaoPromptRewritePage,
   isQuotaNotChargedFailure,
   normalizeComparableText
 } from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
 import type { Account, ApiRequest, AppSettings, DoubaoModel } from "./types.js";
 import { resolveCleanVideoUrl } from "./watermark.js";
-
-const DOUBAO_THREAD_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/thread\/[A-Za-z0-9_-]+(?:\?[^\s"'<>]*)?/i;
 
 type DataChangedCallback = () => void;
 type QueueItem = {
@@ -23,12 +26,52 @@ type QueueItem = {
   mode: "generate" | "recover";
 };
 
+type ShareRecoveryResult = {
+  shareUrl: string | null;
+  candidateCount: number;
+  promptMatchCount: number;
+  generatedMatchCount: number;
+  shareFailureReason: string | null;
+};
+
+type ShareCopyResult = {
+  shareUrl: string | null;
+  reason: string | null;
+};
+
 class DoubaoPageFailureError extends Error {
   constructor(message: string, readonly refundQuota: boolean) {
     super(message);
     this.name = "DoubaoPageFailureError";
   }
 }
+
+class AsyncMutex {
+  private tail = Promise.resolve();
+
+  async runExclusive<T>(operation: () => Promise<T>) {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+}
+
+// Electron's clipboard is process-wide. Serializing share-copy operations prevents
+// parallel account windows from overwriting each other's sentinel or copied URL.
+const clipboardMutex = new AsyncMutex();
+const SHARE_PANEL_WAIT_MS = 3500;
+const CLIPBOARD_WAIT_MS = 2800;
+const CALLBACK_TIMEOUT_MS = 5000;
+const callbackQueues = new Map<string, Promise<void>>();
 
 export class DoubaoExecutor {
   private readonly scheduler: AccountTaskScheduler<QueueItem>;
@@ -95,19 +138,23 @@ export class DoubaoExecutor {
         throw new Error("豆包账号未登录，无法恢复视频结果");
       }
 
-      const shareUrl = await findGeneratedConversationAndCopyShare(win, request.prompt);
-      if (!shareUrl) {
-        throw new Error("未在该账号最近对话中找到匹配的已生成视频，或仍未复制到分享链接");
+      const recovery = await findGeneratedConversationAndCopyShare(win, request.prompt);
+      if (!recovery.shareUrl) {
+        throw new Error(
+          `未找到可恢复的豆包视频：历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍未复制到分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
+        );
       }
+      const shareUrl = recovery.shareUrl;
 
-      const cleanVideoUrl = await this.resolveCleanVideoWithProgress(requestId, settings, shareUrl);
+      const cleanVideo = await this.resolveCleanVideoWithProgress(requestId, settings, shareUrl);
+      const cleanVideoUrl = cleanVideo.url;
       const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
       await this.updateProgress({
         requestId,
         status: "success",
         message: outputVideoPath
-          ? "已恢复结果，去水印 MP4 已验证并保存到本地"
-          : "已恢复结果，去水印 MP4 地址已验证",
+          ? `已恢复结果，去水印 MP4 已验证并保存到本地（${formatWatermarkResolution(cleanVideo)}）`
+          : `已恢复结果，去水印 MP4 地址已验证（${formatWatermarkResolution(cleanVideo)}）`,
         doubaoThreadUrl: shareUrl,
         rawVideoUrl: null,
         cleanVideoUrl,
@@ -115,8 +162,12 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
     } catch (error) {
-      await this.failRequest(request, `恢复结果失败：${errorMessage(error)}`, false);
-      this.database.updateAccount({ id: account.id, currentStatus: "error" });
+      const message = errorMessage(error);
+      await this.failRequest(request, `恢复结果失败：${message}`, false);
+      this.database.updateAccount({
+        id: account.id,
+        currentStatus: /未登录|登录/.test(message) ? "login_required" : "idle"
+      });
       this.onDataChanged();
     } finally {
       if (win && !win.isDestroyed()) win.close();
@@ -196,7 +247,8 @@ export class DoubaoExecutor {
         status: "running",
         message: "正在提交豆包生成"
       });
-      await submitPromptAndWait(win, request.model);
+      const generationBaseline = await inspectGenerationPage(win);
+      await submitPromptAndWait(win, request.model, request.prompt);
       submittedToDoubao = true;
 
       await this.updateProgress({
@@ -205,13 +257,21 @@ export class DoubaoExecutor {
         message: "已提交豆包，等待视频完成并复制分享链接"
       });
 
-      const generationBaselineText = await getPageText(win);
-      const generationResult = await waitForGenerationResult(win, settings.generationTimeoutSeconds, generationBaselineText, async (message) => {
+      const generationResult = await waitForGenerationResult(
+        win,
+        settings.generationTimeoutSeconds,
+        generationBaseline.pageText,
+        generationBaseline.videoUrls,
+        request.prompt,
+        async (message) => {
         await this.updateProgress({ requestId, status: "running", message });
-      });
+        }
+      );
 
       if (!generationResult.shareUrl) {
-        throw new Error("视频已生成，但未提取到豆包分享链接，无法获取去水印视频");
+        throw new Error(
+          `视频已生成，但未提取到豆包分享链接，无法获取去水印视频${generationResult.shareFailureReason ? `（${generationResult.shareFailureReason}）` : ""}`
+        );
       }
 
       const doubaoThreadUrl = generationResult.shareUrl;
@@ -219,15 +279,16 @@ export class DoubaoExecutor {
         throw new Error("接口仅返回去水印视频，本次请求未启用去水印");
       }
 
-      const cleanVideoUrl = await this.resolveCleanVideoWithProgress(requestId, settings, doubaoThreadUrl);
+      const cleanVideo = await this.resolveCleanVideoWithProgress(requestId, settings, doubaoThreadUrl);
+      const cleanVideoUrl = cleanVideo.url;
       const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
 
       await this.updateProgress({
         requestId,
         status: "success",
         message: outputVideoPath
-          ? "视频生成完成，去水印 MP4 已验证并保存到本地"
-          : "视频生成完成，去水印 MP4 地址已验证",
+          ? `视频生成完成，去水印 MP4 已验证并保存到本地（${formatWatermarkResolution(cleanVideo)}）`
+          : `视频生成完成，去水印 MP4 地址已验证（${formatWatermarkResolution(cleanVideo)}）`,
         doubaoThreadUrl,
         rawVideoUrl: null,
         cleanVideoUrl,
@@ -246,7 +307,7 @@ export class DoubaoExecutor {
       await this.failRequest(request, errorMessage(error), shouldRefundQuota);
       this.database.updateAccount({
         id: account.id,
-        currentStatus: keepWindowOpen ? "login_required" : submittedToDoubao && !shouldRefundQuota ? "error" : "idle"
+        currentStatus: keepWindowOpen ? "login_required" : "idle"
       });
       this.onDataChanged();
       if (win && !settings.showExecutorWindow && !keepWindowOpen && !win.isDestroyed()) {
@@ -258,7 +319,7 @@ export class DoubaoExecutor {
   private async updateProgress(input: Parameters<AppDatabase["updateApiRequest"]>[0]) {
     const updated = this.database.updateApiRequest(input);
     this.onDataChanged();
-    await postCallback(updated);
+    postCallback(updated);
     return updated;
   }
 
@@ -267,14 +328,32 @@ export class DoubaoExecutor {
     settings: AppSettings,
     shareUrl: string
   ) {
-    return resolveCleanVideoUrl(settings, shareUrl, async (retry) => {
-      const delaySeconds = Math.ceil(retry.delayMs / 1000);
+    return (async () => {
+      const startedAt = Date.now();
+      let retryCount = 0;
       await this.updateProgress({
         requestId,
         status: "running",
-        message: `去水印资源尚未就绪，${delaySeconds} 秒后进行第 ${retry.nextAttempt}/${retry.maxAttempts} 次解析：${retry.error}`
+        message: "正在请求去水印服务并验证真实 MP4 地址"
       });
-    });
+
+      try {
+        const url = await resolveCleanVideoUrl(settings, shareUrl, async (retry) => {
+          retryCount = retry.nextAttempt - 1;
+          const delaySeconds = Math.ceil(retry.delayMs / 1000);
+          const elapsedSeconds = Math.max(1, Math.ceil(retry.elapsedMs / 1000));
+          await this.updateProgress({
+            requestId,
+            status: "running",
+            message: `去水印第 ${retry.failedAttempt} 次未拿到可播放 MP4，已耗时 ${elapsedSeconds} 秒；${delaySeconds} 秒后进行第 ${retry.nextAttempt}/${retry.maxAttempts} 次解析：${retry.error}`
+          });
+        });
+        return { url, elapsedMs: Date.now() - startedAt, retryCount };
+      } catch (error) {
+        const elapsedSeconds = Math.max(1, Math.ceil((Date.now() - startedAt) / 1000));
+        throw new Error(`${errorMessage(error)}（去水印已耗时 ${elapsedSeconds} 秒，已重试 ${retryCount} 次）`);
+      }
+    })();
   }
 
   private async failRequest(request: ApiRequest, message: string, refunded: boolean) {
@@ -297,29 +376,43 @@ export class DoubaoExecutor {
         partition: account.partition,
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: true
+        sandbox: true,
+        backgroundThrottling: false
       }
     });
   }
 }
 
-async function loadUrl(win: BrowserWindow, url: string) {
+async function loadUrl(win: BrowserWindow, url: string, timeoutMs = 30000) {
   await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const cleanup = () => {
       win.webContents.removeListener("did-finish-load", onFinish);
       win.webContents.removeListener("did-fail-load", onFail);
+      if (timer) clearTimeout(timer);
+    };
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
     };
     const onFinish = () => {
-      cleanup();
-      resolve();
+      finish(resolve);
     };
     const onFail = (_event: Electron.Event, _code: number, description: string) => {
-      cleanup();
-      reject(new Error(`豆包页面加载失败：${description}`));
+      finish(() => reject(new Error(`豆包页面加载失败：${description}`)));
     };
     win.webContents.once("did-finish-load", onFinish);
     win.webContents.once("did-fail-load", onFail);
-    void win.loadURL(url);
+    timer = setTimeout(() => {
+      finish(() => reject(new Error(`豆包页面加载超时（${Math.ceil(timeoutMs / 1000)} 秒）`)));
+      if (!win.isDestroyed()) win.webContents.stop();
+    }, timeoutMs);
+    void win.loadURL(url).catch((error) => {
+      finish(() => reject(error instanceof Error ? error : new Error(String(error))));
+    });
   });
 }
 
@@ -526,7 +619,7 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   await wait(500);
 }
 
-async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel) {
+async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, prompt: string) {
   const baselineText = await getPageText(win);
   const attempts: Array<{ label: string; run: () => Promise<boolean> }> = [
     {
@@ -570,14 +663,14 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel) {
     const didRun = await attempt.run();
     if (!didRun) continue;
     tried.push(attempt.label);
-    const result = await waitForSubmissionStarted(win, model, baselineText, 5000);
-    if (result.confirmed) return;
+    const result = await waitForSubmissionStarted(win, model, baselineText, prompt, 8000);
     if (result.failureMessage) {
       throw new DoubaoPageFailureError(
         `豆包提交后返回失败：${result.failureMessage}`,
         isQuotaNotChargedFailure(result.failureMessage)
       );
     }
+    if (result.confirmed || result.sentEvidence) return;
   }
 
   const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
@@ -726,42 +819,77 @@ async function waitForSubmissionStarted(
   win: BrowserWindow,
   model: DoubaoModel,
   baselineText: string,
+  prompt: string,
   timeoutMs = 15000
 ) {
   const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const state = await runPageScript<{ confirmed: boolean; failureMessage: string | null; pageTextExcerpt: string }>(win, `
+    const state = await runPageScript<{
+      confirmed: boolean;
+      sentEvidence: boolean;
+      failureMessage: string | null;
+      pageTextExcerpt: string;
+    }>(win, `
       (() => {
         const modelLabel = ${JSON.stringify(modelLabel)};
         const baselineText = ${JSON.stringify(baselineText)};
+        const prompt = ${JSON.stringify(prompt)};
         const extractDoubaoFailureMessage = ${extractDoubaoFailureMessage.toString()};
+        const hasNewPromptOccurrence = ${hasNewPromptOccurrence.toString()};
         const hasNewTextOccurrence = ${hasNewTextOccurrence.toString()};
         const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
         const expected = "本次使用 " + modelLabel + " 生成";
         const failureMessage = extractDoubaoFailureMessage(pageText);
+        const newFailureMessage = failureMessage && hasNewTextOccurrence(pageText, baselineText, failureMessage)
+          ? failureMessage
+          : null;
+        const visible = (el) => {
+          const rect = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          return rect.width > 20 && rect.height > 20 && style.visibility !== "hidden" && style.display !== "none";
+        };
+        const editables = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input[type="text"]'))
+          .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+          .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+        const editor = editables[0];
+        const editorText = editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement
+          ? editor.value
+          : (editor?.innerText || editor?.textContent || "");
+        const normalize = (value) => value.replace(/[^\\p{L}\\p{N}]+/gu, "").trim();
+        const normalizedPrompt = normalize(prompt);
+        const promptSignature = normalizedPrompt.slice(0, Math.min(42, Math.max(12, normalizedPrompt.length)));
+        const normalizedEditorText = normalize(editorText);
+        const promptStillInComposer = Boolean(promptSignature && normalizedEditorText.includes(promptSignature));
+        const composerCleared = !editor || normalizedEditorText.length === 0 || !promptStillInComposer;
+        const pageChanged = pageText !== baselineText;
+        const sentEvidence = !newFailureMessage
+          && pageChanged
+          && (hasNewPromptOccurrence(pageText, baselineText, prompt) || composerCleared);
         return {
           confirmed: hasNewTextOccurrence(pageText, baselineText, expected)
             && pageText.includes("视频生成好后")
             && pageText.includes("本次生成将消耗每日免费额度"),
-          failureMessage: failureMessage && hasNewTextOccurrence(pageText, baselineText, failureMessage)
-            ? failureMessage
-            : null,
+          sentEvidence,
+          failureMessage: newFailureMessage,
           pageTextExcerpt: pageText.slice(-500)
         };
       })()
     `);
 
-    if (state.confirmed) {
-      return { confirmed: true, failureMessage: null };
-    }
     if (state.failureMessage) {
-      return { confirmed: false, failureMessage: state.failureMessage };
+      return { confirmed: false, sentEvidence: false, failureMessage: state.failureMessage };
+    }
+    if (state.confirmed) {
+      return { confirmed: true, sentEvidence: true, failureMessage: null };
+    }
+    if (state.sentEvidence) {
+      return { confirmed: false, sentEvidence: true, failureMessage: null };
     }
     await wait(1000);
   }
 
-  return { confirmed: false, failureMessage: null };
+  return { confirmed: false, sentEvidence: false, failureMessage: null };
 }
 
 interface GenerationPageState {
@@ -770,25 +898,32 @@ interface GenerationPageState {
   failureMessage: string | null;
   pageText: string;
   directVideoUrl: string | null;
+  videoUrls: string[];
   visibleVideoCount: number;
 }
 
 interface GenerationResult {
   shareUrl: string | null;
   directVideoUrl: string | null;
+  shareFailureReason?: string | null;
 }
 
 async function waitForGenerationResult(
   win: BrowserWindow,
   timeoutSeconds: number,
   baselineText: string,
+  baselineVideoUrls: string[],
+  prompt: string,
   onProgress: (message: string) => Promise<void> | void
 ): Promise<GenerationResult> {
   const timeoutMs = Math.max(60, timeoutSeconds || 900) * 1000;
+  const historyFallbackMs = Math.max(30000, Math.min(360000, Math.floor(timeoutMs * 0.6)));
   const startedAt = Date.now();
   let generatedAt = 0;
   let lastProgressAt = 0;
   let directVideoUrl: string | null = null;
+  let shareFailureReason: string | null = null;
+  let historyFallbackAttempted = false;
 
   while (Date.now() - startedAt < timeoutMs) {
     const pageState = await inspectGenerationPage(win);
@@ -803,20 +938,44 @@ async function waitForGenerationResult(
       );
     }
 
-    if (pageState.generated) {
+    const hasNewVideoSource = pageState.videoUrls.some((url) => !baselineVideoUrls.includes(url));
+    const generated = pageState.generated && (
+      hasNewGenerationCompletion(pageState.pageText, baselineText)
+      || hasNewVideoSource
+    );
+
+    if (generated) {
       if (!generatedAt) {
         generatedAt = Date.now();
         await onProgress("视频已生成，正在进入分享模式并复制链接");
       }
       directVideoUrl ||= pageState.directVideoUrl;
 
-      const copiedUrl = await tryCopyShareLink(win);
-      if (copiedUrl) {
-        return { shareUrl: copiedUrl, directVideoUrl };
+      const copied = await tryCopyShareLink(win);
+      shareFailureReason = copied.reason;
+      if (copied.shareUrl) {
+        return { shareUrl: copied.shareUrl, directVideoUrl };
       }
 
       if (Date.now() - generatedAt > 120000) {
-        return { shareUrl: null, directVideoUrl };
+        return { shareUrl: null, directVideoUrl, shareFailureReason };
+      }
+    }
+
+    if (!generatedAt && !historyFallbackAttempted && Date.now() - startedAt >= historyFallbackMs) {
+      historyFallbackAttempted = true;
+      await onProgress("当前执行窗口未同步完成状态，正在检查该账号最近对话");
+      const originalUrl = win.webContents.getURL();
+      const recovery = await findGeneratedConversationAndCopyShare(win, prompt);
+      if (recovery.shareUrl) {
+        return { shareUrl: recovery.shareUrl, directVideoUrl };
+      }
+      if (recovery.generatedMatchCount > 0) {
+        return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
+      }
+      if (originalUrl) {
+        await loadUrl(win, originalUrl);
+        await wait(1500);
       }
     }
 
@@ -831,9 +990,19 @@ async function waitForGenerationResult(
   }
 
   if (generatedAt) {
-    return { shareUrl: null, directVideoUrl };
+    return { shareUrl: null, directVideoUrl, shareFailureReason };
   }
-  throw new Error("等待豆包视频生成超时");
+  await onProgress("当前执行窗口等待超时，正在最后检查该账号最近对话");
+  const recovery = await findGeneratedConversationAndCopyShare(win, prompt);
+  if (recovery.shareUrl) {
+    return { shareUrl: recovery.shareUrl, directVideoUrl };
+  }
+  if (recovery.generatedMatchCount > 0) {
+    return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
+  }
+  throw new Error(
+    `等待豆包视频生成超时；历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，未找到已生成视频`
+  );
 }
 
 async function inspectGenerationPage(win: BrowserWindow) {
@@ -847,21 +1016,26 @@ async function inspectGenerationPage(win: BrowserWindow) {
       };
       const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
       const extractDoubaoFailureMessage = ${extractDoubaoFailureMessage.toString()};
+      const isDoubaoGenerationComplete = ${isDoubaoGenerationComplete.toString()};
+      const isDoubaoPromptRewritePage = ${isDoubaoPromptRewritePage.toString()};
       const videos = Array.from(document.querySelectorAll("video")).filter(visible);
-      const videoUrls = videos.flatMap((video) => [
+      const videoSources = videos.flatMap((video) => [
         video.currentSrc,
         video.src,
         ...Array.from(video.querySelectorAll("source[src]")).map((source) => source.src)
-      ]).filter((value) => /^https?:\\/\\//i.test(value || ""));
-      const completedByText = /你的视频生成好[了啦]|视频已生成|视频生成完成|生成视频已完成/.test(pageText);
-      const playableVideo = videos.some((video) => Boolean(video.currentSrc || video.src || video.poster || video.readyState >= 1));
+      ]).filter(Boolean);
+      const videoUrls = videoSources.filter((value) => /^https?:\\/\\//i.test(value || ""));
+      const completedByText = isDoubaoGenerationComplete(pageText);
+      const promptRewrite = isDoubaoPromptRewritePage(pageText);
+      const playableVideo = videos.some((video) => video.readyState >= 1) || videoSources.length > 0;
       const failureMessage = extractDoubaoFailureMessage(pageText);
       return {
-        generated: completedByText || playableVideo,
+        generated: completedByText || (!promptRewrite && playableVideo),
         failed: Boolean(failureMessage),
         failureMessage,
         pageText,
         directVideoUrl: videoUrls[videoUrls.length - 1] || null,
+        videoUrls,
         visibleVideoCount: videos.length
       };
     })()
@@ -869,79 +1043,218 @@ async function inspectGenerationPage(win: BrowserWindow) {
 }
 
 async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt: string) {
+  const normalizedPrompt = normalizeComparableText(prompt);
   const candidates = await runPageScript<string[]>(win, `
-    (() => Array.from(document.querySelectorAll('a[href*="/chat/"]'))
-      .map((link) => link.href)
-      .filter((href, index, values) => /^https?:\\/\\/(?:www\\.)?doubao\\.com\\/chat\\/[A-Za-z0-9_-]+(?:[?#].*)?$/i.test(href)
-        && values.indexOf(href) === index)
-      .slice(0, 30))()
+    (() => {
+      const prompt = ${JSON.stringify(normalizedPrompt)};
+      const normalize = (value) => value.replace(/[^\\p{L}\\p{N}]+/gu, "").trim();
+      const scoreLabel = (label) => {
+        const normalizedLabel = normalize(label);
+        if (!normalizedLabel) return 0;
+        if (prompt.includes(normalizedLabel)) return 10000 + normalizedLabel.length;
+        let bigramMatches = 0;
+        for (let index = 0; index < normalizedLabel.length - 1; index += 1) {
+          if (prompt.includes(normalizedLabel.slice(index, index + 2))) bigramMatches += 1;
+        }
+        return bigramMatches * 100 + Math.min(normalizedLabel.length, 20);
+      };
+      const links = Array.from(document.querySelectorAll('a[href]'))
+        .map((link, index) => ({
+          href: link.href,
+          label: [link.innerText, link.textContent, link.getAttribute("aria-label"), link.getAttribute("title")]
+            .filter(Boolean).join(" "),
+          index
+        }))
+        .filter(({ href }) => {
+          try {
+            const url = new URL(href);
+            return /^(?:www\\.)?doubao\\.com$/i.test(url.hostname)
+              && /^\\/(?:chat|thread|share)\\/[A-Za-z0-9._~-]+/i.test(url.pathname);
+          } catch {
+            return false;
+          }
+        })
+        .map((item) => ({ ...item, score: scoreLabel(item.label) }));
+      const unique = Array.from(new Map(links.map((item) => [item.href, item])).values());
+      return unique
+        .sort((a, b) => b.score - a.score || a.index - b.index)
+        .map((item) => item.href)
+        .slice(0, 30);
+    })()
   `);
-  const signature = normalizeComparableText(prompt).slice(0, 42);
+  const signatureLength = Math.min(42, normalizedPrompt.length);
+  const signatureSpan = Math.max(0, normalizedPrompt.length - signatureLength);
+  const signatures = Array.from(new Set([0, 0.25, 0.5, 0.75, 1]
+    .map((position) => normalizedPrompt.slice(
+      Math.floor(signatureSpan * position),
+      Math.floor(signatureSpan * position) + signatureLength
+    ))
+    .filter((value) => value.length >= 12)));
+  const requiredSignatureMatches = Math.max(1, Math.ceil(signatures.length * 0.8));
+  let promptMatchCount = 0;
+  let generatedMatchCount = 0;
+  let shareFailureReason: string | null = null;
 
   for (const candidate of candidates) {
-    await loadUrl(win, candidate);
-    await wait(1200);
-    const pageText = await runPageScript<string>(win, `document.body?.innerText || ""`);
-    if (!normalizeComparableText(pageText).includes(signature)) continue;
+    try {
+      // A stale conversation link must not block recovery indefinitely. The
+      // newest conversation is normally near the front of this list.
+      await loadUrl(win, candidate, 8000);
+    } catch (error) {
+      console.warn("跳过无法加载的豆包历史对话", candidate, error);
+      continue;
+    }
+    await wait(600);
+
+    let pageText = "";
+    let matchedPrompt = false;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      pageText = await runPageScript<string>(win, `document.body?.innerText || ""`);
+      const normalizedPageText = normalizeComparableText(pageText);
+      const signatureMatches = signatures.filter((signature) => normalizedPageText.includes(signature)).length;
+      matchedPrompt = normalizedPageText.includes(normalizedPrompt)
+        || signatureMatches >= requiredSignatureMatches;
+      if (matchedPrompt) break;
+      await wait(350);
+    }
+    if (!matchedPrompt) continue;
+    promptMatchCount += 1;
 
     const pageState = await inspectGenerationPage(win);
     if (!pageState.generated || pageState.failed) continue;
+    generatedMatchCount += 1;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const shareUrl = await tryCopyShareLink(win);
-      if (shareUrl) return shareUrl;
+      const copied = await tryCopyShareLink(win);
+      shareFailureReason = copied.reason;
+      if (copied.shareUrl) {
+        return {
+          shareUrl: copied.shareUrl,
+          candidateCount: candidates.length,
+          promptMatchCount,
+          generatedMatchCount,
+          shareFailureReason: null
+        };
+      }
       await wait(1000);
     }
   }
 
-  return null;
+  return {
+    shareUrl: null,
+    candidateCount: candidates.length,
+    promptMatchCount,
+    generatedMatchCount,
+    shareFailureReason
+  };
 }
 
 async function tryCopyShareLink(win: BrowserWindow) {
-  const before = clipboard.readText();
-  const clipboardSentinel = `__doubao_share_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
-  clipboard.writeText(clipboardSentinel);
-  let shareState = await inspectShareSelection(win);
+  return clipboardMutex.runExclusive(async () => {
+    if (win.isDestroyed()) return { shareUrl: null, reason: "执行窗口已关闭" } satisfies ShareCopyResult;
 
-  if (!shareState.active) {
-    await openShareSelection(win);
-    const directlyCopiedUrl = extractDoubaoShareUrl(clipboard.readText());
-    if (directlyCopiedUrl) {
-      return directlyCopiedUrl;
+    const before = clipboard.readText();
+    const clipboardSentinel = `__doubao_share_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
+    clipboard.writeText(clipboardSentinel);
+    let result: ShareCopyResult = { shareUrl: null, reason: "未找到分享面板" };
+
+    try {
+      let shareState = await inspectShareSelection(win);
+
+      if (!shareState.active) {
+        await openShareSelection(win);
+        const directlyCopiedUrl = extractDoubaoShareUrl(clipboard.readText());
+        if (directlyCopiedUrl) {
+          result = { shareUrl: directlyCopiedUrl, reason: null };
+          return result;
+        }
+        shareState = await waitForShareSelection(win, SHARE_PANEL_WAIT_MS);
+      }
+
+      if (!shareState.active) {
+        result = { shareUrl: null, reason: "未打开分享面板" };
+        return result;
+      }
+
+      if (!shareState.hasSelection) {
+        const selectAllPoint = await waitForTextControlPoint(win, ["全选"], [], 1800);
+        if (selectAllPoint) {
+          await sendMouseClick(win, selectAllPoint.x, selectAllPoint.y);
+          shareState = await waitForShareSelection(win, 1200);
+        }
+      }
+
+      const copyPoint = await waitForTextControlPoint(win, ["复制链接"], [], 1800);
+      if (!copyPoint) {
+        result = { shareUrl: null, reason: "未找到复制链接控件" };
+        return result;
+      }
+      if (!shareState.copyEnabled && shareState.checkboxCount > 0) {
+        result = { shareUrl: null, reason: "复制链接按钮未启用" };
+        return result;
+      }
+
+      // A native input event is the reliable path for Doubao's clipboard handler.
+      await sendMouseClick(win, copyPoint.x, copyPoint.y);
+      const nativeCopiedUrl = await waitForClipboardShareUrl(CLIPBOARD_WAIT_MS);
+      if (nativeCopiedUrl) {
+        result = { shareUrl: nativeCopiedUrl, reason: null };
+        return result;
+      }
+
+      // Keep a DOM click as a bounded fallback for versions that render the
+      // clickable label separately from the visible button surface.
+      await clickByKeywords(win, ["复制链接"]);
+      const domCopiedUrl = await waitForClipboardShareUrl(CLIPBOARD_WAIT_MS);
+      result = domCopiedUrl
+        ? { shareUrl: domCopiedUrl, reason: null }
+        : { shareUrl: null, reason: "点击复制链接后剪贴板未出现豆包分享地址" };
+      return result;
+    } catch (error) {
+      // Share panels are animated and can be replaced while the generation card
+      // updates. Treat a transient inspection error as a retryable miss.
+      console.warn("豆包复制分享链接暂时失败", error);
+      result = { shareUrl: null, reason: `复制控件检查异常：${errorMessage(error)}` };
+      return result;
+    } finally {
+      if (!result.shareUrl) restoreClipboardAfterFailedShare(before, clipboardSentinel);
     }
-    shareState = await inspectShareSelection(win);
-  }
+  });
+}
 
-  if (!shareState.active) {
-    restoreClipboardAfterFailedShare(before, clipboardSentinel);
-    return null;
+async function waitForClipboardShareUrl(timeoutMs = CLIPBOARD_WAIT_MS) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const shareUrl = extractDoubaoShareUrl(clipboard.readText());
+    if (shareUrl) return shareUrl;
+    await wait(Math.min(150, Math.max(25, timeoutMs - (Date.now() - startedAt))));
   }
+  return extractDoubaoShareUrl(clipboard.readText());
+}
 
-  if (!shareState.hasSelection) {
-    const selectAllPoint = await findTextControlPoint(win, ["全选"]);
-    if (selectAllPoint) {
-      await sendMouseClick(win, selectAllPoint.x, selectAllPoint.y);
-      await wait(500);
-      shareState = await inspectShareSelection(win);
-    }
+async function waitForShareSelection(win: BrowserWindow, timeoutMs: number) {
+  const startedAt = Date.now();
+  let state = await inspectShareSelection(win);
+  while (!state.active && Date.now() - startedAt < timeoutMs) {
+    await wait(180);
+    state = await inspectShareSelection(win);
   }
+  return state;
+}
 
-  const copyPoint = await findTextControlPoint(win, ["复制链接"]);
-  if (!copyPoint || (!shareState.copyEnabled && shareState.checkboxCount > 0)) {
-    restoreClipboardAfterFailedShare(before, clipboardSentinel);
-    return null;
+async function waitForTextControlPoint(
+  win: BrowserWindow,
+  keywords: string[],
+  excluded: string[] = [],
+  timeoutMs = 1800
+) {
+  const startedAt = Date.now();
+  let point = await findTextControlPoint(win, keywords, excluded);
+  while (!point && Date.now() - startedAt < timeoutMs) {
+    await wait(150);
+    point = await findTextControlPoint(win, keywords, excluded);
   }
-
-  await sendMouseClick(win, copyPoint.x, copyPoint.y);
-  await wait(900);
-  const copied = clipboard.readText();
-  const shareUrl = extractDoubaoShareUrl(copied);
-  if (shareUrl) {
-    return shareUrl;
-  }
-
-  restoreClipboardAfterFailedShare(before, clipboardSentinel);
-  return null;
+  return point;
 }
 
 function restoreClipboardAfterFailedShare(before: string, sentinel: string) {
@@ -979,7 +1292,7 @@ async function inspectShareSelection(win: BrowserWindow) {
       const copyEnabled = copyControls.some((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true");
       return {
         active: copyControls.length > 0 && allText.includes("全选"),
-        hasSelection: checked.length > 0 || copyEnabled,
+        hasSelection: checked.length > 0 || (checkboxes.length === 0 && copyEnabled),
         checkboxCount: checkboxes.length,
         copyEnabled
       };
@@ -988,22 +1301,30 @@ async function inspectShareSelection(win: BrowserWindow) {
 }
 
 async function openShareSelection(win: BrowserWindow) {
-  const sharePoint = await findTextControlPoint(win, ["分享"], ["分享图片"]);
+  // Doubao currently labels the video-card entry as “分享图片”. It is the
+  // share entry for the selected media, not an image-only fallback.
+  const sharePoint = await waitForTextControlPoint(win, ["分享图片", "分享"], [], 1800);
   if (sharePoint) {
     await sendMouseClick(win, sharePoint.x, sharePoint.y);
-    await wait(1000);
-    if ((await inspectShareSelection(win)).active) return true;
+    if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
+  }
+
+  // On some Doubao builds the message toolbar is icon-only. Its action order is
+  // copy, share, edit, more; use the button immediately before edit when labels
+  // are absent instead of opening the unrelated overflow menu.
+  const shareIconPoint = await findShareIconPoint(win);
+  if (shareIconPoint) {
+    await sendMouseClick(win, shareIconPoint.x, shareIconPoint.y);
+    if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
   }
 
   const menuPoint = await findOverflowMenuPoint(win);
   if (menuPoint) {
     await sendMouseClick(win, menuPoint.x, menuPoint.y);
-    await wait(500);
-    const menuSharePoint = await findTextControlPoint(win, ["分享"], ["分享图片"]);
+    const menuSharePoint = await waitForTextControlPoint(win, ["分享图片", "分享"], [], 1800);
     if (menuSharePoint) {
       await sendMouseClick(win, menuSharePoint.x, menuSharePoint.y);
-      await wait(1000);
-      return (await inspectShareSelection(win)).active;
+      return (await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active;
     }
   }
 
@@ -1091,6 +1412,47 @@ async function findOverflowMenuPoint(win: BrowserWindow) {
   `);
 }
 
+async function findShareIconPoint(win: BrowserWindow) {
+  const overflowPoint = await findOverflowMenuPoint(win);
+  if (!overflowPoint) return null;
+
+  return runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const anchor = ${JSON.stringify(overflowPoint)};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const nodes = Array.from(document.querySelectorAll('button, [role="button"], [tabindex], [aria-label], [title]'))
+        .filter(visible)
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
+            width: rect.width,
+            height: rect.height
+          };
+        })
+        .filter((item) => item.width <= 64
+          && item.height <= 64
+          && Math.abs(item.y - anchor.y) <= 26
+          && item.x <= anchor.x + 12
+          && item.x >= anchor.x - 170)
+        .sort((a, b) => a.x - b.x);
+
+      const unique = [];
+      for (const item of nodes) {
+        if (!unique.some((existing) => Math.abs(existing.x - item.x) < 8)) unique.push(item);
+      }
+
+      const target = unique.length >= 3 ? unique[unique.length - 3] : null;
+      return target ? { x: Math.round(target.x), y: Math.round(target.y) } : null;
+    })()
+  `);
+}
+
 async function clickByKeywords(win: BrowserWindow, keywords: string[]) {
   return runPageScript<boolean>(win, `
     (() => {
@@ -1149,13 +1511,24 @@ async function downloadCleanVideoIfNeeded(settings: AppSettings, requestId: stri
   return outputPath;
 }
 
-async function postCallback(request: ApiRequest) {
+function postCallback(request: ApiRequest) {
   if (!request.callbackUrl) return;
-  await fetch(request.callbackUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(toPublicApiRequest(request))
-  }).catch(() => undefined);
+
+  const previous = callbackQueues.get(request.requestId) || Promise.resolve();
+  const current = previous
+    .catch(() => undefined)
+    .then(async () => {
+      await fetch(request.callbackUrl!, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(toPublicApiRequest(request)),
+        signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS)
+      }).catch(() => undefined);
+    });
+  callbackQueues.set(request.requestId, current);
+  void current.then(() => {
+    if (callbackQueues.get(request.requestId) === current) callbackQueues.delete(request.requestId);
+  });
 }
 
 async function runPageScript<T>(win: BrowserWindow, script: string) {
@@ -1166,14 +1539,17 @@ async function getPageText(win: BrowserWindow) {
   return runPageScript<string>(win, `(document.body?.innerText || "").replace(/\\s+/g, " ").trim()`);
 }
 
-function extractDoubaoShareUrl(value: string | null | undefined) {
-  if (!value) return null;
-  const matched = value.match(DOUBAO_THREAD_URL_RE)?.[0];
-  return matched?.replace(/[)\]}>，。！？；;]+$/, "") || null;
-}
-
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "执行器未知错误";
+}
+
+function formatElapsed(milliseconds: number) {
+  const seconds = Math.max(1, Math.ceil(milliseconds / 1000));
+  return `${seconds} 秒`;
+}
+
+function formatWatermarkResolution(input: { elapsedMs: number; retryCount: number }) {
+  return `耗时 ${formatElapsed(input.elapsedMs)}，第 ${input.retryCount + 1} 次解析`;
 }
 
 function isRefundableExecutionError(error: unknown) {

@@ -32,6 +32,7 @@ const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 class LocalApiServer {
   private server: Server | null = null;
   private status: ApiServerStatus = {
+    version: app.getVersion(),
     enabled: false,
     running: false,
     port: 0,
@@ -48,6 +49,7 @@ class LocalApiServer {
     await this.stop();
 
     this.status = {
+      version: app.getVersion(),
       enabled: settings.apiServiceEnabled,
       running: false,
       port: settings.apiPort,
@@ -64,6 +66,7 @@ class LocalApiServer {
     await new Promise<void>((resolve) => {
       this.server!.once("error", (error) => {
         this.status = {
+          version: app.getVersion(),
           enabled: true,
           running: false,
           port: settings.apiPort,
@@ -75,6 +78,7 @@ class LocalApiServer {
 
       this.server!.listen(settings.apiPort, "127.0.0.1", () => {
         this.status = {
+          version: app.getVersion(),
           enabled: true,
           running: true,
           port: settings.apiPort,
@@ -306,10 +310,17 @@ async function detectLoginStatus(accountId: number) {
 
   const accountSession = session.fromPartition(account.partition);
   const cookies = await accountSession.cookies.get({ url: "https://www.doubao.com" });
+  const activeRequest = db.listApiRequests(1000).some((request) =>
+    request.accountId === accountId && (request.status === "accepted" || request.status === "running")
+  );
   return db.updateAccount({
     id: accountId,
     loginStatus: cookies.length > 0 ? "logged_in" : "logged_out",
-    currentStatus: cookies.length > 0 ? "idle" : "login_required"
+    currentStatus: cookies.length > 0
+      ? activeRequest
+        ? "busy"
+        : "idle"
+      : "login_required"
   });
 }
 
@@ -572,23 +583,36 @@ async function postCallback(payload: ApiRequest) {
   }).catch(() => undefined);
 }
 
-app.whenReady().then(async () => {
-  log.initialize();
-  db = new AppDatabase();
-  executor = new DoubaoExecutor(db, notifyDataChanged);
-  apiServer = new LocalApiServer(db, executor);
-  registerIpc();
-  await apiServer.applySettings(db.getSettings());
-  createMainWindow();
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow();
-    }
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
   });
-}).catch((error) => {
-  log.error(error);
-});
+
+  app.whenReady().then(async () => {
+    log.initialize();
+    db = new AppDatabase();
+    executor = new DoubaoExecutor(db, notifyDataChanged);
+    apiServer = new LocalApiServer(db, executor);
+    registerIpc();
+    await apiServer.applySettings(db.getSettings());
+    createMainWindow();
+
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createMainWindow();
+      }
+    });
+  }).catch((error) => {
+    log.error(error);
+  });
+}
 
 app.on("before-quit", async () => {
   await apiServer?.stop();
