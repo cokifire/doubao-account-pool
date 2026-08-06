@@ -9,6 +9,7 @@ import {
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
+  isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
   isQuotaNotChargedFailure,
@@ -133,6 +134,7 @@ export class DoubaoExecutor {
       win = this.createExecutionWindow(account, settings);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
       await wait(2500);
+      await dismissDoubaoDesktopDownloadPrompt(win);
 
       if (await looksLoggedOut(win)) {
         throw new Error("豆包账号未登录，无法恢复视频结果");
@@ -205,6 +207,7 @@ export class DoubaoExecutor {
       win = this.createExecutionWindow(account, settings);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
       await wait(2500);
+      await dismissDoubaoDesktopDownloadPrompt(win);
 
       if (await looksLoggedOut(win)) {
         this.database.updateAccount({
@@ -976,6 +979,7 @@ async function waitForGenerationResult(
       if (originalUrl) {
         await loadUrl(win, originalUrl);
         await wait(1500);
+        await dismissDoubaoDesktopDownloadPrompt(win);
       }
     }
 
@@ -1105,6 +1109,7 @@ async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt:
       continue;
     }
     await wait(600);
+    await dismissDoubaoDesktopDownloadPrompt(win);
 
     let pageText = "";
     let matchedPrompt = false;
@@ -1159,6 +1164,7 @@ async function tryCopyShareLink(win: BrowserWindow) {
     let result: ShareCopyResult = { shareUrl: null, reason: "未找到分享面板" };
 
     try {
+      await dismissDoubaoDesktopDownloadPrompt(win);
       let shareState = await inspectShareSelection(win);
 
       if (!shareState.active) {
@@ -1220,6 +1226,104 @@ async function tryCopyShareLink(win: BrowserWindow) {
       if (!result.shareUrl) restoreClipboardAfterFailedShare(before, clipboardSentinel);
     }
   });
+}
+
+async function dismissDoubaoDesktopDownloadPrompt(win: BrowserWindow) {
+  if (win.isDestroyed()) return false;
+
+  const prompt = await runPageScript<{
+    detected: boolean;
+    action: "remind_later" | "close" | null;
+  }>(win, `
+    (() => {
+      const isDoubaoDesktopDownloadPrompt = ${isDoubaoDesktopDownloadPrompt.toString()};
+      const pageText = document.body?.innerText || "";
+      if (!isDoubaoDesktopDownloadPrompt(pageText)) {
+        return { detected: false, action: null };
+      }
+
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4
+          && rect.height > 4
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && style.pointerEvents !== "none";
+      };
+      const textOf = (el) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+      const controls = Array.from(document.querySelectorAll('button, [role="button"], a, [tabindex]'))
+        .filter(visible);
+      const clickTarget = (el) => el.closest('button, [role="button"], a, [tabindex]') || el;
+      const remindLater = controls.find((el) => textOf(el).replace(/\\s+/g, "") === "下次提醒我");
+      if (remindLater) {
+        clickTarget(remindLater).click();
+        return { detected: true, action: "remind_later" };
+      }
+
+      const closeButton = controls.find((el) => {
+        const label = [el.getAttribute("aria-label"), el.getAttribute("title")]
+          .filter(Boolean).join(" ");
+        const text = textOf(el).replace(/\\s+/g, "");
+        return /关闭|close|dismiss/i.test(label) || text === "×" || text === "✕";
+      });
+      if (closeButton) {
+        clickTarget(closeButton).click();
+        return { detected: true, action: "close" };
+      }
+
+      return { detected: true, action: null };
+    })()
+  `);
+
+  if (!prompt.detected) return false;
+  if (!prompt.action) {
+    await sendKeyboard(win, "ESC", undefined, 250);
+  } else {
+    await wait(450);
+  }
+
+  // Some Doubao builds accept the click but leave the modal mounted for a
+  // short period. Verify the marker is gone before trying the share controls.
+  // Esc is harmless when the modal has already closed and prevents a stale
+  // overlay from swallowing the next click when it has not.
+  try {
+    const stillVisible = await runPageScript<boolean>(win, `
+      (() => {
+        const isDoubaoDesktopDownloadPrompt = ${isDoubaoDesktopDownloadPrompt.toString()};
+        const pageText = document.body?.innerText || "";
+        if (!isDoubaoDesktopDownloadPrompt(pageText)) return false;
+        const visible = (el) => {
+          const rect = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          return rect.width > 4
+            && rect.height > 4
+            && style.visibility !== "hidden"
+            && style.display !== "none"
+            && style.pointerEvents !== "none";
+        };
+        const textOf = (el) => [
+          el.innerText,
+          el.textContent,
+          el.getAttribute("aria-label"),
+          el.getAttribute("title")
+        ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+        return Array.from(document.querySelectorAll('button, [role="button"], a, [tabindex]'))
+          .filter(visible)
+          .some((el) => textOf(el).replace(/\\s+/g, "") === "下次提醒我");
+      })()
+    `);
+    if (stillVisible) await sendKeyboard(win, "ESC", undefined, 250);
+  } catch {
+    // The click can trigger a route update; the next page operation will
+    // handle a newly mounted prompt if needed.
+  }
+  return true;
 }
 
 async function waitForClipboardShareUrl(timeoutMs = CLIPBOARD_WAIT_MS) {

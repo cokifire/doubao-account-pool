@@ -25,6 +25,13 @@ export function isDoubaoPromptRewritePage(pageText: string) {
   return /完整\s*\d+(?:\.\d+)?\s*秒视频生成指令|可直接用于(?:AI\s*)?视频生成工具|要不要我再精简一版提示词/.test(text);
 }
 
+export function isDoubaoDesktopDownloadPrompt(pageText: string) {
+  const text = pageText.replace(/\s+/g, " ").trim();
+  return text.includes("下载电脑版")
+    && text.includes("使用完整功能")
+    && text.includes("下次提醒我");
+}
+
 export function isDoubaoGenerationComplete(pageText: string) {
   const text = pageText.replace(/\s+/g, " ").trim();
   return /你的视频(?:已经|已)?生成好[了啦]|视频(?:已经|已)?生成(?:完成|成功|好[了啦])|生成视频(?:已经|已)?完成/.test(text);

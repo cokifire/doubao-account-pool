@@ -3,7 +3,7 @@
 ## 基础信息
 
 - 默认地址：`http://127.0.0.1:17888`
-- 当前接口版本：`0.1.24`
+- 当前接口版本：`0.1.25`
 - 默认认证：`Authorization: Bearer local-doubao-key`
 - 除 `/health` 外，其余接口均需要 Bearer Token。
 - 建议在“配置管理”中修改默认 API Key。

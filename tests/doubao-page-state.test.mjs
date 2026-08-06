@@ -8,6 +8,7 @@ import {
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
+  isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
   isQuotaNotChargedFailure,
@@ -76,6 +77,17 @@ test('does not treat prompt rewrite pages as generated videos', () => {
   )
   assert.equal(
     isDoubaoPromptRewritePage('你的视频生成好了，点击分享即可复制链接。'),
+    false
+  )
+})
+
+test('detects the Doubao desktop-download prompt that can block sharing', () => {
+  assert.equal(
+    isDoubaoDesktopDownloadPrompt('下载电脑版 使用完整功能 随时帮忙的 AI 桌面助手 下载电脑版 下次提醒我'),
+    true
+  )
+  assert.equal(
+    isDoubaoDesktopDownloadPrompt('下载电脑版 使用完整功能 下载电脑版'),
     false
   )
 })
