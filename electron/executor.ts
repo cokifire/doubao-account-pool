@@ -146,7 +146,11 @@ export class DoubaoExecutor {
         throw new Error("豆包账号未登录，无法恢复视频结果");
       }
 
-      const recovery = await findGeneratedConversationAndCopyShare(win, request.prompt);
+      const recovery = await findGeneratedConversationAndCopyShare(
+        win,
+        request.prompt,
+        request.doubaoThreadUrl
+      );
       if (!recovery.shareUrl) {
         throw new Error(
           `未找到可恢复的豆包视频：历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍未复制到分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
@@ -259,6 +263,15 @@ export class DoubaoExecutor {
       const generationBaseline = await inspectGenerationPage(win);
       await submitPromptAndWait(win, request.model, request.prompt);
       submittedToDoubao = true;
+      const submittedConversationUrl = extractDoubaoShareUrl(win.webContents.getURL());
+      if (submittedConversationUrl) {
+        await this.updateProgress({
+          requestId,
+          status: "running",
+          message: "已记录本次豆包会话地址，等待视频完成并复制分享链接",
+          doubaoThreadUrl: submittedConversationUrl
+        });
+      }
 
       await this.updateProgress({
         requestId,
@@ -271,7 +284,9 @@ export class DoubaoExecutor {
         settings.generationTimeoutSeconds,
         generationBaseline.pageText,
         generationBaseline.videoUrls,
+        generationBaseline.playableVideoCount,
         request.prompt,
+        submittedConversationUrl,
         async (message) => {
         await this.updateProgress({ requestId, status: "running", message });
         }
@@ -908,6 +923,8 @@ interface GenerationPageState {
   pageText: string;
   directVideoUrl: string | null;
   videoUrls: string[];
+  visibleVideoCount: number;
+  playableVideoCount: number;
 }
 
 interface GenerationResult {
@@ -921,7 +938,9 @@ async function waitForGenerationResult(
   timeoutSeconds: number,
   baselineText: string,
   baselineVideoUrls: string[],
+  baselinePlayableVideoCount: number,
   prompt: string,
+  preferredConversationUrl: string | null,
   onProgress: (message: string) => Promise<void> | void
 ): Promise<GenerationResult> {
   const timeoutMs = Math.max(60, timeoutSeconds || 900) * 1000;
@@ -950,6 +969,10 @@ async function waitForGenerationResult(
     const newVideoUrls = getNewDoubaoVideoUrls(pageState.videoUrls, baselineVideoUrls);
     const hasNewVideoSource = newVideoUrls.length > 0;
     const newVideoCount = newVideoUrls.length;
+    const newPlayableVideoCount = Math.max(
+      0,
+      pageState.playableVideoCount - baselinePlayableVideoCount
+    );
     const completionTextPresent = hasNewGenerationCompletion(pageState.pageText, baselineText);
     if (completionTextPresent && !completionTextSeenAt) {
       completionTextSeenAt = Date.now();
@@ -963,6 +986,7 @@ async function waitForGenerationResult(
       completionTextPresent,
       hasNewVideoSource,
       newVideoCount,
+      newPlayableVideoCount,
       completionTextSeenAt,
       now: Date.now(),
       graceMs: VIDEO_CARD_GRACE_MS
@@ -975,7 +999,11 @@ async function waitForGenerationResult(
       }
       directVideoUrl ||= pageState.directVideoUrl;
 
-      const copied = await tryCopyShareLink(win, baselineVideoUrls);
+      const copied = await tryCopyShareLink(
+        win,
+        baselineVideoUrls,
+        baselinePlayableVideoCount
+      );
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
         return { shareUrl: copied.shareUrl, directVideoUrl };
@@ -990,7 +1018,11 @@ async function waitForGenerationResult(
       historyFallbackAttempted = true;
       await onProgress("当前执行窗口未同步完成状态，正在检查该账号最近对话");
       const originalUrl = win.webContents.getURL();
-      const recovery = await findGeneratedConversationAndCopyShare(win, prompt);
+      const recovery = await findGeneratedConversationAndCopyShare(
+        win,
+        prompt,
+        preferredConversationUrl
+      );
       if (recovery.shareUrl) {
         return { shareUrl: recovery.shareUrl, directVideoUrl };
       }
@@ -1018,7 +1050,11 @@ async function waitForGenerationResult(
     return { shareUrl: null, directVideoUrl, shareFailureReason };
   }
   await onProgress("当前执行窗口等待超时，正在最后检查该账号最近对话");
-  const recovery = await findGeneratedConversationAndCopyShare(win, prompt);
+  const recovery = await findGeneratedConversationAndCopyShare(
+    win,
+    prompt,
+    preferredConversationUrl
+  );
   if (recovery.shareUrl) {
     return { shareUrl: recovery.shareUrl, directVideoUrl };
   }
@@ -1046,15 +1082,23 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
       const isDoubaoGenerationComplete = ${isDoubaoGenerationComplete.toString()};
       const isDoubaoPromptRewritePage = ${isDoubaoPromptRewritePage.toString()};
       const videos = Array.from(document.querySelectorAll("video")).filter(visible);
-      const videoSources = videos.flatMap((video) => [
+      const videoSourceLists = videos.map((video) => [
         video.currentSrc,
         video.src,
+        video.getAttribute("data-src"),
+        video.getAttribute("data-url"),
+        video.getAttribute("data-video-url"),
+        video.getAttribute("data-download-url"),
         ...Array.from(video.querySelectorAll("source[src]")).map((source) => source.src)
-      ]).filter(Boolean);
+      ].filter(Boolean));
+      const videoSources = videoSourceLists.flat();
       const videoUrls = videoSources.filter((value) => /^https?:\\/\\//i.test(value || ""));
       const completedByText = isDoubaoGenerationComplete(pageText);
       const promptRewrite = isDoubaoPromptRewritePage(pageText);
-      const playableVideo = videos.some((video) => video.readyState >= 1) || videoSources.length > 0;
+      const playableVideoCount = videos.filter((video, index) => (
+        video.readyState >= 1 || videoSourceLists[index].length > 0
+      )).length;
+      const playableVideo = playableVideoCount > 0;
       const failureMessage = extractDoubaoFailureMessage(pageText);
       return {
         generated: completedByText || (!promptRewrite && playableVideo),
@@ -1062,13 +1106,19 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
         failureMessage,
         pageText,
         directVideoUrl: videoUrls[videoUrls.length - 1] || null,
-        videoUrls
+        videoUrls,
+        visibleVideoCount: videos.length,
+        playableVideoCount
       };
     })()
   `);
 }
 
-async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt: string) {
+async function findGeneratedConversationAndCopyShare(
+  win: BrowserWindow,
+  prompt: string,
+  preferredConversationUrl: string | null = null
+) {
   const normalizedPrompt = normalizeComparableText(prompt);
   const candidates = await runPageScript<string[]>(win, `
     (() => {
@@ -1108,6 +1158,11 @@ async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt:
         .slice(0, 30);
     })()
   `);
+  const preferredUrl = extractDoubaoShareUrl(preferredConversationUrl);
+  const orderedCandidates = Array.from(new Set([
+    preferredUrl,
+    ...candidates
+  ].filter((value): value is string => Boolean(value))));
   const signatureLength = Math.min(42, normalizedPrompt.length);
   const signatureSpan = Math.max(0, normalizedPrompt.length - signatureLength);
   const signatures = Array.from(new Set([0, 0.25, 0.5, 0.75, 1]
@@ -1121,7 +1176,7 @@ async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt:
   let generatedMatchCount = 0;
   let shareFailureReason: string | null = null;
 
-  for (const candidate of candidates) {
+  for (const candidate of orderedCandidates) {
     try {
       // A stale conversation link must not block recovery indefinitely. The
       // newest conversation is normally near the front of this list.
@@ -1157,7 +1212,7 @@ async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt:
       if (copied.shareUrl) {
         return {
           shareUrl: copied.shareUrl,
-          candidateCount: candidates.length,
+          candidateCount: orderedCandidates.length,
           promptMatchCount,
           generatedMatchCount,
           shareFailureReason: null
@@ -1169,14 +1224,18 @@ async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt:
 
   return {
     shareUrl: null,
-    candidateCount: candidates.length,
+    candidateCount: orderedCandidates.length,
     promptMatchCount,
     generatedMatchCount,
     shareFailureReason
   };
 }
 
-async function tryCopyShareLink(win: BrowserWindow, baselineVideoUrls: string[] = []) {
+async function tryCopyShareLink(
+  win: BrowserWindow,
+  baselineVideoUrls: string[] = [],
+  baselinePlayableVideoCount = 0
+) {
   return clipboardMutex.runExclusive(async () => {
     if (win.isDestroyed()) return { shareUrl: null, reason: "执行窗口已关闭" } satisfies ShareCopyResult;
 
@@ -1188,14 +1247,22 @@ async function tryCopyShareLink(win: BrowserWindow, baselineVideoUrls: string[] 
     try {
       await dismissDoubaoDesktopDownloadPrompt(win);
 
-      const initialVideo = await waitForCurrentVideoLink(win, baselineVideoUrls);
+      const initialVideo = await waitForCurrentVideoLink(
+        win,
+        baselineVideoUrls,
+        baselinePlayableVideoCount
+      );
       if (!initialVideo.ready) {
         result = { shareUrl: null, reason: initialVideo.reason };
         return result;
       }
 
       const acceptCopiedShareUrl = async (shareUrl: string) => {
-        const video = await waitForCurrentVideoLink(win, baselineVideoUrls);
+        const video = await waitForCurrentVideoLink(
+          win,
+          baselineVideoUrls,
+          baselinePlayableVideoCount
+        );
         if (!video.ready) {
           result = {
             shareUrl: null,
@@ -1249,7 +1316,11 @@ async function tryCopyShareLink(win: BrowserWindow, baselineVideoUrls: string[] 
         return result;
       }
 
-      const readyToCopy = await waitForCurrentVideoLink(win, baselineVideoUrls);
+      const readyToCopy = await waitForCurrentVideoLink(
+        win,
+        baselineVideoUrls,
+        baselinePlayableVideoCount
+      );
       if (!readyToCopy.ready) {
         result = { shareUrl: null, reason: readyToCopy.reason };
         return result;
@@ -1402,6 +1473,7 @@ type VideoLinkCheck = {
 async function waitForCurrentVideoLink(
   win: BrowserWindow,
   baselineVideoUrls: string[],
+  baselinePlayableVideoCount = 0,
   timeoutMs = VIDEO_LINK_WAIT_MS
 ): Promise<VideoLinkCheck> {
   const startedAt = Date.now();
@@ -1409,7 +1481,18 @@ async function waitForCurrentVideoLink(
 
   while (true) {
     const videoUrls = getNewDoubaoVideoUrls(pageState.videoUrls, baselineVideoUrls);
-    if (videoUrls.length > 0) {
+    const newPlayableVideoCount = Math.max(
+      0,
+      pageState.playableVideoCount - baselinePlayableVideoCount
+    );
+    if (pageState.failureMessage) {
+      return {
+        ready: false,
+        videoUrl: null,
+        reason: `当前任务未产生视频：${pageState.failureMessage}`
+      };
+    }
+    if (videoUrls.length > 0 || newPlayableVideoCount > 0) {
       return { ready: true, videoUrl: videoUrls[videoUrls.length - 1], reason: "" };
     }
     if (Date.now() - startedAt >= timeoutMs) break;
@@ -1420,9 +1503,7 @@ async function waitForCurrentVideoLink(
   return {
     ready: false,
     videoUrl: null,
-    reason: pageState.failureMessage
-      ? `当前任务未产生视频：${pageState.failureMessage}`
-      : "当前页面没有检测到当前任务的视频链接，暂不接受分享地址"
+    reason: "当前页面没有检测到当前任务的视频链接，暂不接受分享地址"
   };
 }
 

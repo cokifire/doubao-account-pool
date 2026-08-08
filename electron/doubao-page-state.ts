@@ -68,6 +68,7 @@ export interface GenerationReadyInput {
   completionTextPresent: boolean;
   hasNewVideoSource: boolean;
   newVideoCount: number;
+  newPlayableVideoCount?: number;
   completionTextSeenAt: number;
   now: number;
   graceMs?: number;
@@ -81,7 +82,9 @@ export interface GenerationReadyInput {
  */
 export function isGenerationReadyForShare(input: GenerationReadyInput) {
   if (!input.completionTextPresent) return false;
-  const videoReady = input.hasNewVideoSource || input.newVideoCount > 0;
+  const videoReady = input.hasNewVideoSource
+    || input.newVideoCount > 0
+    || (input.newPlayableVideoCount || 0) > 0;
   if (videoReady) return true;
   const graceMs = input.graceMs ?? 15000;
   return input.completionTextSeenAt > 0 && input.now - input.completionTextSeenAt >= graceMs;

@@ -143,6 +143,8 @@ test('waits for a video element before treating the result as share-ready', () =
   assert.equal(isGenerationReadyForShare({ ...base, hasNewVideoSource: true, now: 2000 }), true)
   // A newly rendered video element also makes it ready.
   assert.equal(isGenerationReadyForShare({ ...base, newVideoCount: 1, now: 3000 }), true)
+  // A playable blob/object URL video is also ready even without an HTTP source.
+  assert.equal(isGenerationReadyForShare({ ...base, newPlayableVideoCount: 1, now: 3000 }), true)
   // Stale videos from earlier tasks do not count.
   assert.equal(isGenerationReadyForShare({ ...base, newVideoCount: 0, now: 3000 }), false)
   // After the grace window the text signal alone is accepted as a fallback.
