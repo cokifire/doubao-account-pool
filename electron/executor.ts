@@ -6,12 +6,14 @@ import { AccountTaskScheduler } from "./account-scheduler.js";
 import {
   extractDoubaoFailureMessage,
   extractDoubaoShareUrl,
+  getNewDoubaoVideoUrls,
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
   isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
+  isGenerationReadyForShare,
   isQuotaNotChargedFailure,
   normalizeComparableText
 } from "./doubao-page-state.js";
@@ -72,6 +74,10 @@ const clipboardMutex = new AsyncMutex();
 const SHARE_PANEL_WAIT_MS = 3500;
 const CLIPBOARD_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
+const VIDEO_LINK_WAIT_MS = 3000;
+// How long to keep waiting after the "视频生成好了" text for the finished
+// video card to render before falling back to the text-only completion signal.
+const VIDEO_CARD_GRACE_MS = 15000;
 const callbackQueues = new Map<string, Promise<void>>();
 
 export class DoubaoExecutor {
@@ -902,7 +908,6 @@ interface GenerationPageState {
   pageText: string;
   directVideoUrl: string | null;
   videoUrls: string[];
-  visibleVideoCount: number;
 }
 
 interface GenerationResult {
@@ -923,6 +928,7 @@ async function waitForGenerationResult(
   const historyFallbackMs = Math.max(30000, Math.min(360000, Math.floor(timeoutMs * 0.6)));
   const startedAt = Date.now();
   let generatedAt = 0;
+  let completionTextSeenAt = 0;
   let lastProgressAt = 0;
   let directVideoUrl: string | null = null;
   let shareFailureReason: string | null = null;
@@ -941,11 +947,26 @@ async function waitForGenerationResult(
       );
     }
 
-    const hasNewVideoSource = pageState.videoUrls.some((url) => !baselineVideoUrls.includes(url));
-    const generated = pageState.generated && (
-      hasNewGenerationCompletion(pageState.pageText, baselineText)
-      || hasNewVideoSource
-    );
+    const newVideoUrls = getNewDoubaoVideoUrls(pageState.videoUrls, baselineVideoUrls);
+    const hasNewVideoSource = newVideoUrls.length > 0;
+    const newVideoCount = newVideoUrls.length;
+    const completionTextPresent = hasNewGenerationCompletion(pageState.pageText, baselineText);
+    if (completionTextPresent && !completionTextSeenAt) {
+      completionTextSeenAt = Date.now();
+    }
+    // Doubao renders the "视频生成好了" text before the finished video card
+    // appears. Copying the share link in that window yields a thread URL
+    // without the video, so prefer to wait briefly for a video element. If the
+    // card never materializes within the grace window, fall back to the text
+    // signal rather than blocking the task forever.
+    const generated = isGenerationReadyForShare({
+      completionTextPresent,
+      hasNewVideoSource,
+      newVideoCount,
+      completionTextSeenAt,
+      now: Date.now(),
+      graceMs: VIDEO_CARD_GRACE_MS
+    });
 
     if (generated) {
       if (!generatedAt) {
@@ -954,7 +975,7 @@ async function waitForGenerationResult(
       }
       directVideoUrl ||= pageState.directVideoUrl;
 
-      const copied = await tryCopyShareLink(win);
+      const copied = await tryCopyShareLink(win, baselineVideoUrls);
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
         return { shareUrl: copied.shareUrl, directVideoUrl };
@@ -1009,10 +1030,12 @@ async function waitForGenerationResult(
   );
 }
 
-async function inspectGenerationPage(win: BrowserWindow) {
+async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) {
   return runPageScript<GenerationPageState>(win, `
     (() => {
-      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
+      if (${scrollToLatest}) {
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
+      }
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
@@ -1039,8 +1062,7 @@ async function inspectGenerationPage(win: BrowserWindow) {
         failureMessage,
         pageText,
         directVideoUrl: videoUrls[videoUrls.length - 1] || null,
-        videoUrls,
-        visibleVideoCount: videos.length
+        videoUrls
       };
     })()
   `);
@@ -1154,7 +1176,7 @@ async function findGeneratedConversationAndCopyShare(win: BrowserWindow, prompt:
   };
 }
 
-async function tryCopyShareLink(win: BrowserWindow) {
+async function tryCopyShareLink(win: BrowserWindow, baselineVideoUrls: string[] = []) {
   return clipboardMutex.runExclusive(async () => {
     if (win.isDestroyed()) return { shareUrl: null, reason: "执行窗口已关闭" } satisfies ShareCopyResult;
 
@@ -1165,13 +1187,33 @@ async function tryCopyShareLink(win: BrowserWindow) {
 
     try {
       await dismissDoubaoDesktopDownloadPrompt(win);
+
+      const initialVideo = await waitForCurrentVideoLink(win, baselineVideoUrls);
+      if (!initialVideo.ready) {
+        result = { shareUrl: null, reason: initialVideo.reason };
+        return result;
+      }
+
+      const acceptCopiedShareUrl = async (shareUrl: string) => {
+        const video = await waitForCurrentVideoLink(win, baselineVideoUrls);
+        if (!video.ready) {
+          result = {
+            shareUrl: null,
+            reason: `已复制豆包分享地址，但${video.reason}`
+          };
+          return false;
+        }
+        result = { shareUrl, reason: null };
+        return true;
+      };
+
       let shareState = await inspectShareSelection(win);
 
       if (!shareState.active) {
         await openShareSelection(win);
         const directlyCopiedUrl = extractDoubaoShareUrl(clipboard.readText());
         if (directlyCopiedUrl) {
-          result = { shareUrl: directlyCopiedUrl, reason: null };
+          await acceptCopiedShareUrl(directlyCopiedUrl);
           return result;
         }
         shareState = await waitForShareSelection(win, SHARE_PANEL_WAIT_MS);
@@ -1190,6 +1232,13 @@ async function tryCopyShareLink(win: BrowserWindow) {
         }
       }
 
+      // The copy button starts disabled while the share panel settles or until
+      // the target content is selected. Poll for it instead of failing on the
+      // first inspection so a slow panel is not treated as a failed copy.
+      if (!shareState.copyEnabled) {
+        shareState = await waitForShareCopyEnabled(win, SHARE_PANEL_WAIT_MS);
+      }
+
       const copyPoint = await waitForTextControlPoint(win, ["复制链接"], [], 1800);
       if (!copyPoint) {
         result = { shareUrl: null, reason: "未找到复制链接控件" };
@@ -1200,11 +1249,17 @@ async function tryCopyShareLink(win: BrowserWindow) {
         return result;
       }
 
+      const readyToCopy = await waitForCurrentVideoLink(win, baselineVideoUrls);
+      if (!readyToCopy.ready) {
+        result = { shareUrl: null, reason: readyToCopy.reason };
+        return result;
+      }
+
       // A native input event is the reliable path for Doubao's clipboard handler.
       await sendMouseClick(win, copyPoint.x, copyPoint.y);
       const nativeCopiedUrl = await waitForClipboardShareUrl(CLIPBOARD_WAIT_MS);
       if (nativeCopiedUrl) {
-        result = { shareUrl: nativeCopiedUrl, reason: null };
+        await acceptCopiedShareUrl(nativeCopiedUrl);
         return result;
       }
 
@@ -1212,9 +1267,11 @@ async function tryCopyShareLink(win: BrowserWindow) {
       // clickable label separately from the visible button surface.
       await clickByKeywords(win, ["复制链接"]);
       const domCopiedUrl = await waitForClipboardShareUrl(CLIPBOARD_WAIT_MS);
-      result = domCopiedUrl
-        ? { shareUrl: domCopiedUrl, reason: null }
-        : { shareUrl: null, reason: "点击复制链接后剪贴板未出现豆包分享地址" };
+      if (domCopiedUrl) {
+        await acceptCopiedShareUrl(domCopiedUrl);
+      } else {
+        result = { shareUrl: null, reason: "点击复制链接后剪贴板未出现豆包分享地址" };
+      }
       return result;
     } catch (error) {
       // Share panels are animated and can be replaced while the generation card
@@ -1336,10 +1393,53 @@ async function waitForClipboardShareUrl(timeoutMs = CLIPBOARD_WAIT_MS) {
   return extractDoubaoShareUrl(clipboard.readText());
 }
 
+type VideoLinkCheck = {
+  ready: boolean;
+  videoUrl: string | null;
+  reason: string;
+};
+
+async function waitForCurrentVideoLink(
+  win: BrowserWindow,
+  baselineVideoUrls: string[],
+  timeoutMs = VIDEO_LINK_WAIT_MS
+): Promise<VideoLinkCheck> {
+  const startedAt = Date.now();
+  let pageState = await inspectGenerationPage(win, false);
+
+  while (true) {
+    const videoUrls = getNewDoubaoVideoUrls(pageState.videoUrls, baselineVideoUrls);
+    if (videoUrls.length > 0) {
+      return { ready: true, videoUrl: videoUrls[videoUrls.length - 1], reason: "" };
+    }
+    if (Date.now() - startedAt >= timeoutMs) break;
+    await wait(180);
+    pageState = await inspectGenerationPage(win, false);
+  }
+
+  return {
+    ready: false,
+    videoUrl: null,
+    reason: pageState.failureMessage
+      ? `当前任务未产生视频：${pageState.failureMessage}`
+      : "当前页面没有检测到当前任务的视频链接，暂不接受分享地址"
+  };
+}
+
 async function waitForShareSelection(win: BrowserWindow, timeoutMs: number) {
   const startedAt = Date.now();
   let state = await inspectShareSelection(win);
   while (!state.active && Date.now() - startedAt < timeoutMs) {
+    await wait(180);
+    state = await inspectShareSelection(win);
+  }
+  return state;
+}
+
+async function waitForShareCopyEnabled(win: BrowserWindow, timeoutMs: number) {
+  const startedAt = Date.now();
+  let state = await inspectShareSelection(win);
+  while (!state.copyEnabled && Date.now() - startedAt < timeoutMs) {
     await wait(180);
     state = await inspectShareSelection(win);
   }

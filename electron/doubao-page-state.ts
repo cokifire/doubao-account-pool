@@ -51,6 +51,42 @@ export function hasNewGenerationCompletion(currentText: string, baselineText: st
   return GENERATION_COMPLETE_PATTERNS.some((pattern) => countMatches(current, pattern) > countMatches(baseline, pattern));
 }
 
+export function getNewDoubaoVideoUrls(currentUrls: string[], baselineUrls: string[]) {
+  const baseline = new Set(baselineUrls);
+  return Array.from(new Set(currentUrls.filter((url) => {
+    if (!/^https?:\/\//i.test(url) || baseline.has(url)) return false;
+    try {
+      const hostname = new URL(url).hostname.toLowerCase();
+      return hostname !== "doubao.com" && hostname !== "www.doubao.com";
+    } catch {
+      return false;
+    }
+  })));
+}
+
+export interface GenerationReadyInput {
+  completionTextPresent: boolean;
+  hasNewVideoSource: boolean;
+  newVideoCount: number;
+  completionTextSeenAt: number;
+  now: number;
+  graceMs?: number;
+}
+
+/**
+ * Decides whether a finished Doubao video is safe to share. Doubao renders the
+ * "视频生成好了" text before the finished video card appears; copying the share
+ * link in that window yields a thread URL without the video. Prefer to wait for
+ * a real video element, falling back to the text signal after `graceMs`.
+ */
+export function isGenerationReadyForShare(input: GenerationReadyInput) {
+  if (!input.completionTextPresent) return false;
+  const videoReady = input.hasNewVideoSource || input.newVideoCount > 0;
+  if (videoReady) return true;
+  const graceMs = input.graceMs ?? 15000;
+  return input.completionTextSeenAt > 0 && input.now - input.completionTextSeenAt >= graceMs;
+}
+
 export function extractDoubaoFailureMessage(pageText: string) {
   const text = pageText.replace(/\s+/g, " ").trim();
   if (!text) return null;
@@ -63,6 +99,8 @@ export function extractDoubaoFailureMessage(pageText: string) {
     /换个主题再试试[^。！？]*(?:[。！？]|$)/,
     /生成额度未扣除[^。！？]*(?:[。！？]|$)/,
     /额度未扣除[^。！？]*(?:[。！？]|$)/,
+    /今日(?:的)?(?:视频)?(?:生成)?(?:免费)?(?:生成)?次数(?:已|已经)?用完[^。！？]*(?:[。！？]|$)/,
+    /免费(?:生成)?次数(?:已|已经)?用完[^。！？]*(?:[。！？]|$)/,
     /视频生成失败[^。！？]*(?:[。！？]|$)/,
     /生成视频失败[^。！？]*(?:[。！？]|$)/,
     /未能生成视频[^。！？]*(?:[。！？]|$)/

@@ -16,7 +16,7 @@ type TabKey = "accounts" | "settings" | "logs";
 const accounts = ref<Account[]>([]);
 const apiRequests = ref<ApiRequest[]>([]);
 const apiStatus = ref<ApiServerStatus>({
-  version: "0.1.25",
+  version: "0.1.26",
   enabled: false,
   running: false,
   port: 0,

@@ -5,12 +5,14 @@ import {
   containsPromptSignature,
   extractDoubaoFailureMessage,
   extractDoubaoShareUrl,
+  getNewDoubaoVideoUrls,
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
   isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
+  isGenerationReadyForShare,
   isQuotaNotChargedFailure,
   promptSignature,
 } from '../dist-electron/doubao-page-state.js'
@@ -28,6 +30,14 @@ test('detects common generation failure text', () => {
   assert.equal(extractDoubaoFailureMessage('你的视频免费额度还有 2 次。'), null)
 })
 
+test('detects the exhausted daily free generation quota message', () => {
+  assert.equal(extractDoubaoFailureMessage('今日视频生成免费次数已用完。'), '今日视频生成免费次数已用完。')
+  assert.equal(extractDoubaoFailureMessage('今日免费生成次数已用完，明天再来吧。'), '今日免费生成次数已用完，明天再来吧。')
+  assert.equal(extractDoubaoFailureMessage('今日生成次数已用完。'), '今日生成次数已用完。')
+  assert.equal(extractDoubaoFailureMessage('免费生成次数已用完，请明天再试。'), '免费生成次数已用完，请明天再试。')
+  assert.equal(isQuotaNotChargedFailure('今日视频生成免费次数已用完'), false)
+})
+
 test('matches the current prompt by normalized signature', () => {
   const prompt = '生成视频：口播台词 “但如果经量突然明显增多，应该及时检查。”'
   const composerText = '生成视频 口播台词 但如果经量突然明显增多 应该及时检查'
@@ -35,6 +45,20 @@ test('matches the current prompt by normalized signature', () => {
   assert.equal(promptSignature(prompt).length > 10, true)
   assert.equal(containsPromptSignature(composerText, prompt), true)
   assert.equal(containsPromptSignature('搜索：其他历史对话', prompt), false)
+})
+
+test('accepts only new HTTP video links for the current generation', () => {
+  assert.deepEqual(
+    getNewDoubaoVideoUrls(
+      ['https://cdn.example.com/old.mp4', 'https://cdn.example.com/current.mp4', 'blob:current'],
+      ['https://cdn.example.com/old.mp4']
+    ),
+    ['https://cdn.example.com/current.mp4']
+  )
+  assert.deepEqual(
+    getNewDoubaoVideoUrls(['https://www.doubao.com/thread/xbsMtOGRraAcehDc8'], []),
+    []
+  )
 })
 
 test('recognizes only newly added page messages', () => {
@@ -103,4 +127,28 @@ test('only treats a newly added completion message as the current result', () =>
 
   assert.equal(hasNewGenerationCompletion(oldMessages, oldMessages), false)
   assert.equal(hasNewGenerationCompletion(currentMessages, oldMessages), true)
+})
+
+test('waits for a video element before treating the result as share-ready', () => {
+  const base = {
+    completionTextPresent: true,
+    hasNewVideoSource: false,
+    newVideoCount: 0,
+    completionTextSeenAt: 1000,
+    graceMs: 15000
+  }
+  // Text alone is not enough: still waiting for the video card.
+  assert.equal(isGenerationReadyForShare({ ...base, now: 5000 }), false)
+  // A new video source makes it ready immediately.
+  assert.equal(isGenerationReadyForShare({ ...base, hasNewVideoSource: true, now: 2000 }), true)
+  // A newly rendered video element also makes it ready.
+  assert.equal(isGenerationReadyForShare({ ...base, newVideoCount: 1, now: 3000 }), true)
+  // Stale videos from earlier tasks do not count.
+  assert.equal(isGenerationReadyForShare({ ...base, newVideoCount: 0, now: 3000 }), false)
+  // After the grace window the text signal alone is accepted as a fallback.
+  assert.equal(isGenerationReadyForShare({ ...base, now: 17000 }), true)
+  // No completion text means never ready, even with videos on the page.
+  assert.equal(isGenerationReadyForShare({ ...base, completionTextPresent: false, newVideoCount: 1, now: 17000 }), false)
+  // Completion text seen but grace not yet elapsed still waits.
+  assert.equal(isGenerationReadyForShare({ ...base, completionTextSeenAt: 0, now: 17000 }), false)
 })

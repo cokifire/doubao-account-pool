@@ -2,7 +2,7 @@
 
 豆包账号池是一款基于 Electron 的本地桌面工具，用于管理多个相互隔离的豆包登录环境，并通过本地 HTTP API 为无限画布或其他工作流提供视频生成能力。
 
-当前版本：`0.1.25`
+当前版本：`0.1.26`
 
 ## 主要功能
 
@@ -22,8 +22,8 @@
 
 请从 [Releases](../../releases/latest) 下载当前版本：
 
-- macOS Apple Silicon：`Doubao-Account-Pool-0.1.25-macOS-arm64.dmg`
-- Windows x64：`Doubao-Account-Pool-0.1.25-Windows-x64.exe`
+- macOS Apple Silicon：`Doubao-Account-Pool-0.1.26-macOS-arm64.dmg`
+- Windows x64：`Doubao-Account-Pool-0.1.26-Windows-x64.exe`
 
 macOS 应用已进行完整 ad-hoc 签名，避免因 Electron 临时签名不完整而显示“应用已损坏”。当前安装包尚未使用 Apple Developer ID 公证或 Windows 商业代码签名，Gatekeeper 或 SmartScreen 首次运行时仍可能显示来源提示。请核对发布页中的 SHA-256；macOS 首次尝试打开后，可进入“系统设置 > 隐私与安全性”，在安全性区域选择“仍要打开”。
 
