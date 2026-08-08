@@ -15,6 +15,7 @@ const UNSUPPORTED_RE = /平台暂不支持|暂不支持|不支持该平台|unsup
 // first retry short, then back off without making the normal path wait minutes.
 export const WATERMARK_RETRY_DELAYS_MS = [0, 2500, 6000, 12000, 20000, 30000] as const;
 const REQUEST_TIMEOUT_MS = 20000;
+const SHARE_PAGE_TIMEOUT_MS = 10000;
 
 export interface WatermarkRetryInfo {
   failedAttempt: number;
@@ -27,10 +28,62 @@ export interface WatermarkRetryInfo {
 
 type WatermarkRetryCallback = (info: WatermarkRetryInfo) => void | Promise<void>;
 
+export interface WatermarkResolveOptions {
+  maxAttempts?: number;
+}
+
+export function getWatermarkRetryDelays(
+  maxAttempts: number = WATERMARK_RETRY_DELAYS_MS.length
+) {
+  const attemptCount = Math.max(
+    1,
+    Math.min(WATERMARK_RETRY_DELAYS_MS.length, Math.floor(maxAttempts))
+  );
+  return WATERMARK_RETRY_DELAYS_MS.slice(0, attemptCount);
+}
+
+export function hasDoubaoShareVideoResource(html: string) {
+  if (!html.trim()) return false;
+
+  const normalized = html
+    .replace(/&quot;|&#34;|&#x22;/gi, '"')
+    .replace(/&amp;/gi, "&")
+    .replace(/\\u002f/gi, "/");
+  const hasCompletion = /你的视频(?:已经|已)?生成好[了啦]/.test(normalized);
+  const hasVideoBlock = /creation_block|video_dsz(?:2)?_watermark|video_pre_watermark/i.test(normalized);
+  const hasMp4 = /download_url/i.test(normalized)
+    && /mime_type(?:\\+"|"|[^A-Za-z0-9]){0,12}video_mp4|video_type(?:\\+"|"|[^A-Za-z0-9]){0,12}mp4/i.test(normalized);
+  return hasCompletion && hasVideoBlock && hasMp4;
+}
+
+export async function verifyDoubaoShareVideoResource(shareUrl: string) {
+  let response: Response;
+  try {
+    response = await fetch(shareUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      redirect: "follow",
+      signal: AbortSignal.timeout(SHARE_PAGE_TIMEOUT_MS)
+    });
+  } catch (error) {
+    throw new Error(`复制出的豆包分享页无法访问：${errorMessage(error)}`);
+  }
+
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`复制出的豆包分享页无法访问：HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  if (!hasDoubaoShareVideoResource(html)) {
+    throw new Error("复制出的豆包分享页没有包含当前视频资源");
+  }
+}
+
 export async function resolveCleanVideoUrl(
   settings: AppSettings,
   shareUrl: string,
-  onRetry?: WatermarkRetryCallback
+  onRetry?: WatermarkRetryCallback,
+  options: WatermarkResolveOptions = {}
 ) {
   if (!settings.watermarkApiToken.trim()) {
     throw new Error("未配置去水印 Token，无法返回可用视频");
@@ -38,22 +91,23 @@ export async function resolveCleanVideoUrl(
 
   let lastError: unknown;
   const startedAt = Date.now();
-  for (let attempt = 0; attempt < WATERMARK_RETRY_DELAYS_MS.length; attempt += 1) {
-    const delayMs = WATERMARK_RETRY_DELAYS_MS[attempt];
+  const retryDelays = getWatermarkRetryDelays(options.maxAttempts);
+  for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
+    const delayMs = retryDelays[attempt];
     if (delayMs) await wait(delayMs);
 
     try {
       return await resolveCleanVideoUrlOnce(settings, shareUrl);
     } catch (error) {
       lastError = error;
-      if (!isRetryableWatermarkError(error) || attempt === WATERMARK_RETRY_DELAYS_MS.length - 1) {
+      if (!isRetryableWatermarkError(error) || attempt === retryDelays.length - 1) {
         throw error;
       }
       await onRetry?.({
         failedAttempt: attempt + 1,
         nextAttempt: attempt + 2,
-        maxAttempts: WATERMARK_RETRY_DELAYS_MS.length,
-        delayMs: WATERMARK_RETRY_DELAYS_MS[attempt + 1],
+        maxAttempts: retryDelays.length,
+        delayMs: retryDelays[attempt + 1],
         error: errorMessage(error),
         elapsedMs: Date.now() - startedAt
       });

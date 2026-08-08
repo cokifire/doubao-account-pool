@@ -3,10 +3,17 @@ export function normalizeComparableText(value: string) {
 }
 
 const DOUBAO_SHARE_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/(?:thread|chat|share)\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
+const DOUBAO_CONVERSATION_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/chat\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
 
 export function extractDoubaoShareUrl(value: string | null | undefined) {
   if (!value) return null;
   const matched = value.match(DOUBAO_SHARE_URL_RE)?.[0];
+  return matched?.replace(/[)\]}>，。！？；;]+$/, "") || null;
+}
+
+export function extractDoubaoConversationUrl(value: string | null | undefined) {
+  if (!value) return null;
+  const matched = value.match(DOUBAO_CONVERSATION_URL_RE)?.[0];
   return matched?.replace(/[)\]}>，。！？；;]+$/, "") || null;
 }
 

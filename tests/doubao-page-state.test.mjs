@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   containsPromptSignature,
+  extractDoubaoConversationUrl,
   extractDoubaoFailureMessage,
   extractDoubaoShareUrl,
   getNewDoubaoVideoUrls,
@@ -92,6 +93,18 @@ test('extracts current Doubao share URL formats', () => {
     'https://www.doubao.com/share/share-123'
   )
   assert.equal(extractDoubaoShareUrl('https://example.com/thread/abc'), null)
+})
+
+test('accepts only chat pages as recoverable source conversations', () => {
+  assert.equal(
+    extractDoubaoConversationUrl('https://www.doubao.com/chat/local_2452181702532277'),
+    'https://www.doubao.com/chat/local_2452181702532277'
+  )
+  assert.equal(
+    extractDoubaoConversationUrl('https://www.doubao.com/chat/38437129678594562'),
+    'https://www.doubao.com/chat/38437129678594562'
+  )
+  assert.equal(extractDoubaoConversationUrl('https://www.doubao.com/thread/xZR7KqTbeRvEAjlB8'), null)
 })
 
 test('does not treat prompt rewrite pages as generated videos', () => {
