@@ -2,6 +2,7 @@ export type LoginStatus = "unknown" | "logged_in" | "logged_out";
 export type AccountRuntimeStatus = "idle" | "busy" | "error" | "login_required";
 export type DoubaoModel = "seedance_2_0_mini" | "seedance_2_0_fast";
 export type ApiRequestStatus = "accepted" | "running" | "success" | "failed" | "stopped";
+export type OperationLogStatus = "info" | "success" | "failed";
 
 export interface Account {
   id: number;
@@ -100,6 +101,28 @@ export interface ApiRequestUpdateInput {
   rawVideoUrl?: string | null;
   cleanVideoUrl?: string | null;
   outputVideoPath?: string | null;
+}
+
+export interface OperationLog {
+  id: number;
+  requestId: string | null;
+  accountId: number | null;
+  accountName: string | null;
+  accountPartition: string | null;
+  action: string;
+  status: OperationLogStatus;
+  message: string;
+  targetUrl: string | null;
+  createdAt: string;
+}
+
+export interface OperationLogCreateInput {
+  requestId?: string | null;
+  accountId?: number | null;
+  action: string;
+  status?: OperationLogStatus;
+  message: string;
+  targetUrl?: string | null;
 }
 
 export interface ApiServerStatus {

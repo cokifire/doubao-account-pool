@@ -26,6 +26,10 @@ const api = {
     list: (limit?: number) => ipcRenderer.invoke("api-requests:list", limit),
     clear: () => ipcRenderer.invoke("api-requests:clear")
   },
+  operationLogs: {
+    list: (limit?: number) => ipcRenderer.invoke("operation-logs:list", limit),
+    clear: () => ipcRenderer.invoke("operation-logs:clear")
+  },
   events: {
     onDataChanged: (callback: () => void) => {
       const listener = () => callback();

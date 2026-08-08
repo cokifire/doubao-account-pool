@@ -965,6 +965,58 @@ pre {
   background: #f8fafc;
 }
 
+.operation-logs-table {
+  min-width: 1280px;
+}
+
+.operation-col-time {
+  width: 10%;
+}
+
+.operation-col-account {
+  width: 13%;
+}
+
+.operation-col-request {
+  width: 17%;
+}
+
+.operation-col-action {
+  width: 12%;
+}
+
+.operation-col-message {
+  width: 25%;
+}
+
+.operation-col-url {
+  width: 23%;
+}
+
+.operation-action {
+  color: #1e5bb8;
+  font-weight: 650;
+}
+
+.operation-url-cell {
+  display: grid;
+  gap: 6px;
+}
+
+.operation-url-cell a {
+  display: block;
+  overflow: hidden;
+  color: #356fc2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-url-cell .icon-button {
+  justify-self: start;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
 .request-detail-modal {
   width: min(780px, calc(100vw - 48px));
   max-height: calc(100vh - 48px);

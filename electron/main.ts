@@ -166,6 +166,12 @@ class LocalApiServer {
             removeWatermark: true,
             callbackUrl: body.callbackUrl
           });
+          this.database.appendOperationLog({
+            requestId,
+            action: "分配账号",
+            status: "failed",
+            message: failed.message
+          });
           notifyDataChanged();
           void postCallback(failed);
           sendJson(response, 409, toPublicApiRequest(failed));
@@ -190,6 +196,13 @@ class LocalApiServer {
         if (settings.executorEnabled) {
           this.requestExecutor.enqueue(created.requestId);
         }
+        this.database.appendOperationLog({
+          requestId,
+          accountId: account.id,
+          action: "接收接口请求",
+          status: "success",
+          message: created.message
+        });
         notifyDataChanged();
         void postCallback(created);
         sendJson(response, 202, toPublicApiRequest(created));
@@ -209,6 +222,13 @@ class LocalApiServer {
           return;
         }
         this.requestExecutor.enqueueRecovery(requestId);
+        this.database.appendOperationLog({
+          requestId,
+          accountId: apiRequest.accountId,
+          action: "恢复视频结果",
+          status: "info",
+          message: "已进入结果恢复队列，不会重新提交视频生成"
+        });
         sendJson(response, 202, {
           requestId,
           status: "accepted",
@@ -237,6 +257,7 @@ class LocalApiServer {
         }
         try {
           const cleanVideoUrl = await resolveCleanVideoUrl(settings, sourceUrl);
+          recordOperation(null, null, "独立去水印解析", "success", "已验证真实 MP4 地址", sourceUrl);
           sendJson(response, 200, {
             status: "success",
             message: "去水印 MP4 地址已验证",
@@ -244,6 +265,14 @@ class LocalApiServer {
             outputVideoPath: null
           });
         } catch (error) {
+          recordOperation(
+            null,
+            null,
+            "独立去水印解析",
+            "failed",
+            error instanceof Error ? error.message : "去水印解析失败",
+            sourceUrl
+          );
           sendJson(response, 422, {
             status: "failed",
             message: error instanceof Error ? error.message : "去水印解析失败",
@@ -348,28 +377,60 @@ async function clearAccountSession(accountId: number) {
 
 function registerIpc() {
   ipcMain.handle("accounts:list", () => db.listAccounts());
-  ipcMain.handle("accounts:create", (_event, remark?: string) => db.createAccount({ remark }));
-  ipcMain.handle("accounts:update", (_event, input: AccountUpdateInput) => db.updateAccount(input));
+  ipcMain.handle("accounts:create", (_event, remark?: string) => {
+    const account = db.createAccount({ remark });
+    recordOperation(null, account.id, "创建账号", "success", `已创建 ${account.partition}`);
+    return account;
+  });
+  ipcMain.handle("accounts:update", (_event, input: AccountUpdateInput) => {
+    const account = db.updateAccount(input);
+    recordOperation(null, account.id, "修改账号设置", "success", "已保存账号备注和额度设置");
+    return account;
+  });
   ipcMain.handle("accounts:delete", async (_event, id: number) => {
+    const account = db.getAccount(id);
     await clearAccountSession(id);
     db.deleteAccount(id);
+    recordOperation(null, id, "删除账号", "success", `已删除 ${account?.partition || id}`);
     return true;
   });
-  ipcMain.handle("accounts:open", (_event, id: number) => createDoubaoWindow(id));
+  ipcMain.handle("accounts:open", (_event, id: number) => {
+    const result = createDoubaoWindow(id);
+    recordOperation(null, id, "打开豆包窗口", "success", "已打开独立账号窗口");
+    return result;
+  });
   ipcMain.handle("accounts:relogin", async (_event, id: number) => {
     await clearAccountSession(id);
     createDoubaoWindow(id);
+    recordOperation(null, id, "重新登录账号", "success", "已清空登录状态并打开登录窗口");
     return true;
   });
-  ipcMain.handle("accounts:detect-login", (_event, id: number) => detectLoginStatus(id));
-  ipcMain.handle("accounts:detect-all", () => detectAllLoginStatuses());
-  ipcMain.handle("accounts:reset-quota", (_event, id: number) => db.resetAccountQuota(id));
-  ipcMain.handle("accounts:reset-all-quotas", () => db.resetAllQuotas());
+  ipcMain.handle("accounts:detect-login", async (_event, id: number) => {
+    const account = await detectLoginStatus(id);
+    recordOperation(null, id, "检测登录状态", "success", `当前状态：${account.loginStatus}`);
+    return account;
+  });
+  ipcMain.handle("accounts:detect-all", async () => {
+    const accounts = await detectAllLoginStatuses();
+    recordOperation(null, null, "检测全部账号", "success", `已检测 ${accounts.length} 个账号`);
+    return accounts;
+  });
+  ipcMain.handle("accounts:reset-quota", (_event, id: number) => {
+    const accounts = db.resetAccountQuota(id);
+    recordOperation(null, id, "重置账号额度", "success", "已重置今日额度");
+    return accounts;
+  });
+  ipcMain.handle("accounts:reset-all-quotas", () => {
+    const accounts = db.resetAllQuotas();
+    recordOperation(null, null, "重置全部额度", "success", `已重置 ${accounts.length} 个账号`);
+    return accounts;
+  });
 
   ipcMain.handle("settings:get", () => db.getSettings());
   ipcMain.handle("settings:update", async (_event, input: AppSettingsUpdateInput) => {
     const settings = db.updateSettings(input);
     await apiServer.applySettings(settings);
+    recordOperation(null, null, "保存配置", "success", "配置已保存并应用");
     return settings;
   });
 
@@ -381,6 +442,23 @@ function registerIpc() {
     db.clearApiRequests();
     return true;
   });
+  ipcMain.handle("operation-logs:list", (_event, limit?: number) => db.listOperationLogs(limit || 500));
+  ipcMain.handle("operation-logs:clear", () => {
+    db.clearOperationLogs();
+    return true;
+  });
+}
+
+function recordOperation(
+  requestId: string | null,
+  accountId: number | null,
+  action: string,
+  status: "info" | "success" | "failed",
+  message: string,
+  targetUrl?: string | null
+) {
+  db.appendOperationLog({ requestId, accountId, action, status, message, targetUrl });
+  notifyDataChanged();
 }
 
 function notifyDataChanged() {

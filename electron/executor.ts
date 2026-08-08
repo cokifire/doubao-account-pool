@@ -19,7 +19,7 @@ import {
   normalizeComparableText
 } from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
-import type { Account, ApiRequest, AppSettings, DoubaoModel } from "./types.js";
+import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoModel } from "./types.js";
 import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource } from "./watermark.js";
 
 type DataChangedCallback = () => void;
@@ -156,6 +156,13 @@ export class DoubaoExecutor {
           `未找到可恢复的豆包视频：历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍未复制到分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
         );
       }
+      this.recordOperation(
+        requestId,
+        "复制分享地址",
+        "success",
+        "已复制并确认豆包分享页包含视频资源",
+        recovery.shareUrl
+      );
       const resolvedVideo = await this.resolveCleanVideoForVerifiedShare(
         requestId,
         settings,
@@ -302,6 +309,14 @@ export class DoubaoExecutor {
         );
       }
 
+      this.recordOperation(
+        requestId,
+        "复制分享地址",
+        "success",
+        "已复制并确认豆包分享页包含视频资源",
+        generationResult.shareUrl
+      );
+
       if (!request.removeWatermark) {
         throw new Error("接口仅返回去水印视频，本次请求未启用去水印");
       }
@@ -351,9 +366,36 @@ export class DoubaoExecutor {
 
   private async updateProgress(input: Parameters<AppDatabase["updateApiRequest"]>[0]) {
     const updated = this.database.updateApiRequest(input);
+    this.database.appendOperationLog({
+      requestId: updated.requestId,
+      accountId: updated.accountId,
+      action: operationAction(input.message || "", input.status),
+      status: input.status === "failed" ? "failed" : input.status === "success" ? "success" : "info",
+      message: input.message || "",
+      targetUrl: input.doubaoThreadUrl || input.rawVideoUrl || input.cleanVideoUrl || null
+    });
     this.onDataChanged();
     postCallback(updated);
     return updated;
+  }
+
+  private recordOperation(
+    requestId: string,
+    action: string,
+    status: "info" | "success" | "failed",
+    message: string,
+    targetUrl?: string | null
+  ) {
+    const request = this.database.getApiRequest(requestId);
+    this.database.appendOperationLog({
+      requestId,
+      accountId: request?.accountId ?? null,
+      action,
+      status,
+      message,
+      targetUrl
+    });
+    this.onDataChanged();
   }
 
   private resolveCleanVideoWithProgress(
@@ -1851,6 +1893,19 @@ async function getPageText(win: BrowserWindow) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "执行器未知错误";
+}
+
+function operationAction(message: string, status?: ApiRequestStatus) {
+  if (status === "success") return "任务完成";
+  if (status === "failed") return "任务失败";
+  if (message.includes("上传参考图")) return "上传参考图";
+  if (message.includes("填写提示词")) return "填写提示词";
+  if (message.includes("切换豆包视频生成模式")) return "切换视频生成模式";
+  if (message.includes("提交豆包")) return "提交视频任务";
+  if (message.includes("复制分享")) return "复制分享地址";
+  if (message.includes("去水印")) return "去水印解析";
+  if (message.includes("等待视频") || message.includes("定位豆包")) return "等待视频结果";
+  return "任务进度";
 }
 
 function formatElapsed(milliseconds: number) {

@@ -4,7 +4,8 @@ import type {
   ApiRequest,
   ApiServerStatus,
   AppSettings,
-  AppSettingsUpdateInput
+  AppSettingsUpdateInput,
+  OperationLog
 } from "../electron/types";
 
 declare global {
@@ -32,6 +33,10 @@ declare global {
       };
       apiRequests: {
         list: (limit?: number) => Promise<ApiRequest[]>;
+        clear: () => Promise<boolean>;
+      };
+      operationLogs: {
+        list: (limit?: number) => Promise<OperationLog[]>;
         clear: () => Promise<boolean>;
       };
       events: {

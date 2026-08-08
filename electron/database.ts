@@ -12,10 +12,13 @@ import type {
   ApiRequestUpdateInput,
   AppSettings,
   AppSettingsUpdateInput,
-  DoubaoModel
+  DoubaoModel,
+  OperationLog,
+  OperationLogCreateInput
 } from "./types.js";
 
 const now = () => new Date().toISOString();
+const OPERATION_LOG_RETENTION_DAYS = 3;
 
 const DEFAULT_SETTINGS: AppSettings = {
   apiServiceEnabled: true,
@@ -93,10 +96,26 @@ export class AppDatabase {
         finished_at TEXT,
         FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
       );
+
+      CREATE TABLE IF NOT EXISTS operation_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT,
+        account_id INTEGER,
+        action TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'info',
+        message TEXT NOT NULL DEFAULT '',
+        target_url TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_operation_logs_created_at ON operation_logs(created_at);
+      CREATE INDEX IF NOT EXISTS idx_operation_logs_request_id ON operation_logs(request_id);
     `);
 
     this.ensureAccountColumns();
     this.ensureApiRequestColumns();
+    this.pruneOperationLogs();
     this.cleanInvalidSuccessfulResults();
     this.ensureDefaultSettings();
     this.migrateExecutorConcurrency();
@@ -515,6 +534,81 @@ export class AppDatabase {
     this.db.prepare("DELETE FROM api_requests").run();
   }
 
+  appendOperationLog(input: OperationLogCreateInput): OperationLog {
+    this.pruneOperationLogs();
+    const timestamp = now();
+    const result = this.db.prepare(`
+      INSERT INTO operation_logs (
+        request_id,
+        account_id,
+        action,
+        status,
+        message,
+        target_url,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.requestId || null,
+      input.accountId ?? null,
+      input.action,
+      input.status || "info",
+      input.message,
+      input.targetUrl || null,
+      timestamp
+    );
+    return this.getOperationLog(Number(result.lastInsertRowid))!;
+  }
+
+  listOperationLogs(limit = 500): OperationLog[] {
+    this.pruneOperationLogs();
+    return this.db.prepare(`
+      SELECT
+        operation_logs.id,
+        operation_logs.request_id AS requestId,
+        operation_logs.account_id AS accountId,
+        accounts.name AS accountName,
+        accounts.partition AS accountPartition,
+        operation_logs.action,
+        operation_logs.status,
+        operation_logs.message,
+        operation_logs.target_url AS targetUrl,
+        operation_logs.created_at AS createdAt
+      FROM operation_logs
+      LEFT JOIN accounts ON accounts.id = operation_logs.account_id
+      ORDER BY operation_logs.id DESC
+      LIMIT ?
+    `).all(Math.max(1, Math.min(2000, limit))).map(normalizeOperationLog);
+  }
+
+  getOperationLog(id: number): OperationLog | undefined {
+    const row = this.db.prepare(`
+      SELECT
+        operation_logs.id,
+        operation_logs.request_id AS requestId,
+        operation_logs.account_id AS accountId,
+        accounts.name AS accountName,
+        accounts.partition AS accountPartition,
+        operation_logs.action,
+        operation_logs.status,
+        operation_logs.message,
+        operation_logs.target_url AS targetUrl,
+        operation_logs.created_at AS createdAt
+      FROM operation_logs
+      LEFT JOIN accounts ON accounts.id = operation_logs.account_id
+      WHERE operation_logs.id = ?
+    `).get(id);
+    return row ? normalizeOperationLog(row) : undefined;
+  }
+
+  clearOperationLogs() {
+    this.db.prepare("DELETE FROM operation_logs").run();
+  }
+
+  private pruneOperationLogs() {
+    const cutoff = new Date(Date.now() - OPERATION_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    this.db.prepare("DELETE FROM operation_logs WHERE created_at < ?").run(cutoff);
+  }
+
   private ensureDefaultSettings() {
     const existingCount = this.db.prepare("SELECT COUNT(*) AS count FROM settings").get() as { count: number };
     if (existingCount.count === 0) {
@@ -646,5 +740,18 @@ function normalizeApiRequest(row: unknown): ApiRequest {
   return {
     ...request,
     removeWatermark: Boolean(request.removeWatermark)
+  };
+}
+
+function normalizeOperationLog(row: unknown): OperationLog {
+  const log = row as OperationLog & { accountId: number | null };
+  return {
+    ...log,
+    requestId: log.requestId || null,
+    accountId: log.accountId === null || log.accountId === undefined ? null : Number(log.accountId),
+    accountName: log.accountName || null,
+    accountPartition: log.accountPartition || null,
+    status: log.status === "success" || log.status === "failed" ? log.status : "info",
+    targetUrl: log.targetUrl || null
   };
 }

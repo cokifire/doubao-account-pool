@@ -8,15 +8,18 @@ import type {
   ApiServerStatus,
   AppSettings,
   DoubaoModel,
-  LoginStatus
+  LoginStatus,
+  OperationLog,
+  OperationLogStatus
 } from "../electron/types";
 
-type TabKey = "accounts" | "settings" | "logs";
+type TabKey = "accounts" | "settings" | "logs" | "actions";
 
 const accounts = ref<Account[]>([]);
 const apiRequests = ref<ApiRequest[]>([]);
+const operationLogs = ref<OperationLog[]>([]);
 const apiStatus = ref<ApiServerStatus>({
-  version: "0.1.26",
+  version: "0.1.27",
   enabled: false,
   running: false,
   port: 0,
@@ -34,6 +37,8 @@ const batchMenuOpen = ref(false);
 const apiAddressCopied = ref(false);
 const logSearch = ref("");
 const logStatusFilter = ref<"all" | ApiRequestStatus>("all");
+const operationSearch = ref("");
+const operationStatusFilter = ref<"all" | OperationLogStatus>("all");
 const copiedField = ref<"prompt" | "result" | null>(null);
 
 const accountSettingsForm = reactive({
@@ -110,6 +115,22 @@ const filteredApiRequests = computed(() => {
       item.accountName,
       item.outputVideoPath,
       item.cleanVideoUrl
+    ].some((value) => value?.toLocaleLowerCase("zh-CN").includes(keyword));
+  });
+});
+
+const filteredOperationLogs = computed(() => {
+  const keyword = operationSearch.value.trim().toLocaleLowerCase("zh-CN");
+  return operationLogs.value.filter((item) => {
+    if (operationStatusFilter.value !== "all" && item.status !== operationStatusFilter.value) return false;
+    if (!keyword) return true;
+    return [
+      item.requestId,
+      item.action,
+      item.message,
+      item.accountName,
+      item.accountPartition,
+      item.targetUrl
     ].some((value) => value?.toLocaleLowerCase("zh-CN").includes(keyword));
   });
 });
@@ -193,14 +214,16 @@ async function refresh() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-  const [accountRows, settings, status, requests] = await Promise.all([
+  const [accountRows, settings, status, requests, actions] = await Promise.all([
     window.doubaoManager.accounts.list(),
     window.doubaoManager.settings.get(),
     window.doubaoManager.apiServer.status(),
-    window.doubaoManager.apiRequests.list(100)
+    window.doubaoManager.apiRequests.list(100),
+    window.doubaoManager.operationLogs.list(500)
   ]);
   accounts.value = accountRows;
   apiRequests.value = requests;
+  operationLogs.value = actions;
   apiStatus.value = status;
   Object.assign(settingsForm, settings);
   } finally {
@@ -313,6 +336,12 @@ async function clearLogs() {
   await refresh();
 }
 
+async function clearOperationLogs() {
+  if (!window.confirm("清空全部行动日志？三天前的日志会自动清理。")) return;
+  await window.doubaoManager.operationLogs.clear();
+  await refresh();
+}
+
 function formatTime(value: string | null) {
   if (!value) return "-";
   return new Intl.DateTimeFormat("zh-CN", {
@@ -396,6 +425,11 @@ async function copyRequestValue(field: "prompt" | "result", value: string) {
   window.setTimeout(() => {
     if (copiedField.value === field) copiedField.value = null;
   }, 1500);
+}
+
+async function copyOperationUrl(value: string) {
+  if (!value) return;
+  await navigator.clipboard.writeText(value);
 }
 
 function accountCode(account: Account) {
@@ -523,6 +557,7 @@ onBeforeUnmount(() => {
       <button :class="{ active: activeTab === 'accounts' }" @click="activeTab = 'accounts'">账号池</button>
       <button :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">配置管理</button>
       <button :class="{ active: activeTab === 'logs' }" @click="activeTab = 'logs'">接口日志</button>
+      <button :class="{ active: activeTab === 'actions' }" @click="activeTab = 'actions'">行动日志</button>
     </nav>
 
     <section v-if="loading" class="empty">加载中...</section>
@@ -802,7 +837,7 @@ onBeforeUnmount(() => {
       </aside>
     </section>
 
-    <section v-else class="panel logs-panel">
+    <section v-else-if="activeTab === 'logs'" class="panel logs-panel">
       <div class="section-title">
         <div>
           <h2>接口日志</h2>
@@ -883,6 +918,80 @@ onBeforeUnmount(() => {
         </table>
         <div v-if="!apiRequests.length" class="empty compact">还没有接口请求。</div>
         <div v-else-if="!filteredApiRequests.length" class="empty compact">没有符合当前条件的日志。</div>
+      </div>
+    </section>
+
+    <section v-else class="panel logs-panel operation-logs-panel">
+      <div class="section-title">
+        <div>
+          <h2>行动日志</h2>
+          <p>记录每个任务和账号操作的详细步骤，日志自动保留 3 天。</p>
+        </div>
+        <div class="toolbar">
+          <button class="button" @click="refresh">刷新</button>
+          <button class="button danger" @click="clearOperationLogs">清空</button>
+        </div>
+      </div>
+
+      <div class="log-filters">
+        <label class="log-search">
+          <span>搜索行动</span>
+          <input v-model="operationSearch" type="search" placeholder="任务 ID、动作、账号、地址或错误信息" />
+        </label>
+        <label class="log-status-filter">
+          <span>结果</span>
+          <select v-model="operationStatusFilter">
+            <option value="all">全部</option>
+            <option value="info">进行中</option>
+            <option value="success">成功</option>
+            <option value="failed">失败</option>
+          </select>
+        </label>
+        <span class="log-count">显示 {{ filteredOperationLogs.length }} / {{ operationLogs.length }} 条</span>
+      </div>
+
+      <div class="table-wrap logs-table-wrap">
+        <table class="logs-table operation-logs-table">
+          <colgroup>
+            <col class="operation-col-time" />
+            <col class="operation-col-account" />
+            <col class="operation-col-request" />
+            <col class="operation-col-action" />
+            <col class="operation-col-message" />
+            <col class="operation-col-url" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>账号</th>
+              <th>任务 ID</th>
+              <th>动作</th>
+              <th>详细记录</th>
+              <th>地址</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in filteredOperationLogs" :key="item.id">
+              <td class="cell-meta" :title="fullTime(item.createdAt)">{{ formatTime(item.createdAt) }}</td>
+              <td>
+                <strong>{{ item.accountName || "系统" }}</strong>
+                <span v-if="item.accountPartition" class="cell-meta">{{ item.accountPartition }}</span>
+              </td>
+              <td><code class="request-id">{{ item.requestId || "-" }}</code></td>
+              <td><span class="operation-action">{{ item.action }}</span></td>
+              <td><p class="message-preview">{{ item.message || "-" }}</p></td>
+              <td>
+                <div v-if="item.targetUrl" class="operation-url-cell">
+                  <a :href="item.targetUrl" target="_blank" rel="noreferrer">{{ item.targetUrl }}</a>
+                  <button class="icon-button" type="button" @click="copyOperationUrl(item.targetUrl)">复制</button>
+                </div>
+                <span v-else class="cell-meta">-</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="!operationLogs.length" class="empty compact">还没有行动日志。</div>
+        <div v-else-if="!filteredOperationLogs.length" class="empty compact">没有符合条件的行动日志。</div>
       </div>
     </section>
 
