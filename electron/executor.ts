@@ -274,7 +274,7 @@ export class DoubaoExecutor {
       const generationBaseline = await inspectGenerationPage(win);
       await submitPromptAndWait(win, request.model, request.prompt);
       submittedToDoubao = true;
-      const submittedConversationUrl = extractDoubaoShareUrl(win.webContents.getURL());
+      const submittedConversationUrl = await waitForSubmittedConversationUrl(win);
       if (submittedConversationUrl) {
         await this.updateProgress({
           requestId,
@@ -1090,10 +1090,11 @@ async function waitForGenerationResult(
       historyFallbackAttempted = true;
       await onProgress("当前执行窗口未同步完成状态，正在检查该账号最近对话");
       const originalUrl = win.webContents.getURL();
+      const currentConversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
       const recovery = await findGeneratedConversationAndCopyShare(
         win,
         prompt,
-        preferredConversationUrl
+        currentConversationUrl || preferredConversationUrl
       );
       if (recovery.shareUrl) {
         return { shareUrl: recovery.shareUrl, directVideoUrl };
@@ -1125,7 +1126,7 @@ async function waitForGenerationResult(
   const recovery = await findGeneratedConversationAndCopyShare(
     win,
     prompt,
-    preferredConversationUrl
+    extractDoubaoConversationUrl(win.webContents.getURL()) || preferredConversationUrl
   );
   if (recovery.shareUrl) {
     return { shareUrl: recovery.shareUrl, directVideoUrl };
@@ -1661,23 +1662,26 @@ async function openShareSelection(win: BrowserWindow) {
     if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
   }
 
+  const menuPoint = await findOverflowMenuPoint(win);
+  if (menuPoint) {
+    await sendMouseClick(win, menuPoint.x, menuPoint.y);
+    const menuSharePoint = await waitForTextControlPoint(win, ["分享"], ["分享图片"], 1800);
+    if (menuSharePoint) {
+      await sendMouseClick(win, menuSharePoint.x, menuSharePoint.y);
+      if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
+    }
+    // A wrong header candidate can open an unrelated popover. Close it before
+    // trying the icon-only fallback so the next click is not swallowed.
+    await sendKeyboard(win, "ESC", undefined, 250);
+  }
+
   // On some Doubao builds the message toolbar is icon-only. Its action order is
   // copy, share, edit, more; use the button immediately before edit when labels
-  // are absent instead of opening the unrelated overflow menu.
+  // are absent as a final fallback after the verified header menu path.
   const shareIconPoint = await findShareIconPoint(win);
   if (shareIconPoint) {
     await sendMouseClick(win, shareIconPoint.x, shareIconPoint.y);
     if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
-  }
-
-  const menuPoint = await findOverflowMenuPoint(win);
-  if (menuPoint) {
-    await sendMouseClick(win, menuPoint.x, menuPoint.y);
-    const menuSharePoint = await waitForTextControlPoint(win, ["分享图片", "分享"], [], 1800);
-    if (menuSharePoint) {
-      await sendMouseClick(win, menuSharePoint.x, menuSharePoint.y);
-      return (await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active;
-    }
   }
 
   return false;
@@ -1736,32 +1740,69 @@ async function findOverflowMenuPoint(win: BrowserWindow) {
         const style = getComputedStyle(el);
         return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
       };
+      const textOf = (el) => [el.innerText, el.textContent, el.getAttribute("aria-label"), el.getAttribute("title")]
+        .filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
       const allNodes = Array.from(document.querySelectorAll('button, [role="button"], [tabindex], [aria-label], [title]'))
         .filter(visible)
         .map((el) => {
           const rect = el.getBoundingClientRect();
-          const text = [el.innerText, el.textContent, el.getAttribute("aria-label"), el.getAttribute("title")]
-            .filter(Boolean).join(" ").trim();
-          return { rect, text };
+          return { rect, text: textOf(el) };
         });
-      const labeledNodes = allNodes
-        .filter((item) => /更多|操作|^\\.{3}$|^…$|^⋯$/.test(item.text) && item.rect.width <= 80 && item.rect.height <= 80)
-        .sort((a, b) => b.rect.right - a.rect.right || a.rect.top - b.rect.top);
-      const headerFallback = allNodes
-        .filter((item) => item.rect.top >= 0
-          && item.rect.top <= 120
-          && item.rect.right >= window.innerWidth * 0.82
+      const headerNodes = allNodes.filter((item) => {
+        const centerX = item.rect.left + item.rect.width / 2;
+        const centerY = item.rect.top + item.rect.height / 2;
+        return centerY >= 0
+          && centerY <= 120
+          && centerX >= window.innerWidth * 0.65
+          && item.rect.width <= 180
+          && item.rect.height <= 80;
+      });
+      const labeledNodes = headerNodes
+        .filter((item) => /更多|操作|^\\.{3}$|^…$|^⋯$/.test(item.text)
+          && !/下载电脑版|播报|朗读|静音/.test(item.text)
           && item.rect.width <= 80
           && item.rect.height <= 80)
-        .sort((a, b) => b.rect.right - a.rect.right);
-      const headerLabeled = labeledNodes.filter((item) => item.rect.top <= 120);
-      const target = headerLabeled[0] || headerFallback[0] || labeledNodes[0];
+        .sort((a, b) => b.rect.right - a.rect.right || a.rect.top - b.rect.top);
+      const downloadNode = headerNodes
+        .filter((item) => /下载电脑版/.test(item.text))
+        .sort((a, b) => a.rect.width - b.rect.width)[0];
+      const smallHeaderNodes = headerNodes
+        .filter((item) => !/下载电脑版|播报|朗读|静音/.test(item.text)
+          && item.rect.width <= 80
+          && item.rect.height <= 80);
+      const adjacentToDownload = downloadNode
+        ? smallHeaderNodes
+          .filter((item) => item.rect.right <= downloadNode.rect.left + 12
+            && item.rect.right >= downloadNode.rect.left - 120
+            && Math.abs((item.rect.top + item.rect.height / 2)
+              - (downloadNode.rect.top + downloadNode.rect.height / 2)) <= 26)
+          .sort((a, b) => {
+            const distanceA = downloadNode.rect.left - a.rect.right;
+            const distanceB = downloadNode.rect.left - b.rect.right;
+            return distanceA - distanceB;
+          })
+        : [];
+      const target = labeledNodes[0]
+        || adjacentToDownload[0]
+        || smallHeaderNodes.sort((a, b) => b.rect.right - a.rect.right)[0];
       return target ? {
         x: Math.round(target.rect.left + target.rect.width / 2),
         y: Math.round(target.rect.top + target.rect.height / 2)
       } : null;
     })()
   `);
+}
+
+async function waitForSubmittedConversationUrl(win: BrowserWindow, timeoutMs = 2600) {
+  let conversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs
+    && (!conversationUrl || /\/chat\/local_/i.test(conversationUrl))) {
+    await wait(200);
+    const currentUrl = extractDoubaoConversationUrl(win.webContents.getURL());
+    if (currentUrl) conversationUrl = currentUrl;
+  }
+  return conversationUrl;
 }
 
 async function findShareIconPoint(win: BrowserWindow) {
