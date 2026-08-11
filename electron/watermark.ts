@@ -11,9 +11,9 @@ const VIDEO_URL_KEYS = [
 ];
 
 const UNSUPPORTED_RE = /平台暂不支持|暂不支持|不支持该平台|unsupported platform|not supported/i;
-// The provider may return before its clean MP4/CDN object is ready. Keep the
-// first retry short, then back off without making the normal path wait minutes.
-export const WATERMARK_RETRY_DELAYS_MS = [0, 2500, 6000, 12000, 20000, 30000] as const;
+// The provider may return before its clean MP4/CDN object is ready. Use a
+// longer backoff so eventual-consistency responses are not treated as failures.
+export const WATERMARK_RETRY_DELAYS_MS = [0, 5000, 15000, 30000, 60000] as const;
 const REQUEST_TIMEOUT_MS = 20000;
 const SHARE_PAGE_TIMEOUT_MS = 10000;
 

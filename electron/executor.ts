@@ -447,8 +447,7 @@ export class DoubaoExecutor {
       const cleanVideo = await this.resolveCleanVideoWithProgress(
         requestId,
         settings,
-        shareUrl,
-        3
+        shareUrl
       );
       return { shareUrl, cleanVideo };
     } catch (error) {

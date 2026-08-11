@@ -42,7 +42,7 @@ test('does not retry unsupported platforms', () => {
 })
 
 test('uses a short first retry and bounded backoff', () => {
-  assert.deepEqual([...WATERMARK_RETRY_DELAYS_MS], [0, 2500, 6000, 12000, 20000, 30000])
-  assert.deepEqual([...getWatermarkRetryDelays(3)], [0, 2500, 6000])
+  assert.deepEqual([...WATERMARK_RETRY_DELAYS_MS], [0, 5000, 15000, 30000, 60000])
+  assert.deepEqual([...getWatermarkRetryDelays(3)], [0, 5000, 15000])
   assert.deepEqual([...getWatermarkRetryDelays(99)], [...WATERMARK_RETRY_DELAYS_MS])
 })
