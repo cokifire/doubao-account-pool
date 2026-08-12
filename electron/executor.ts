@@ -75,9 +75,7 @@ const clipboardMutex = new AsyncMutex();
 const SHARE_PANEL_WAIT_MS = 3500;
 const CLIPBOARD_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
-// How long to keep waiting after the "视频生成好了" text for the finished
-// video card to render before falling back to the text-only completion signal.
-const VIDEO_CARD_GRACE_MS = 15000;
+const VIDEO_CARD_WAIT_MS = 15000;
 const callbackQueues = new Map<string, Promise<void>>();
 
 export class DoubaoExecutor {
@@ -279,7 +277,7 @@ export class DoubaoExecutor {
         await this.updateProgress({
           requestId,
           status: "running",
-          message: "已记录本次豆包会话地址，等待视频完成并复制分享链接",
+          message: "已记录本次豆包会话地址，等待视频完成",
           doubaoThreadUrl: submittedConversationUrl
         });
       }
@@ -296,6 +294,7 @@ export class DoubaoExecutor {
         generationBaseline.pageText,
         generationBaseline.videoUrls,
         generationBaseline.playableVideoCount,
+        generationBaseline.videoCardCount,
         request.prompt,
         submittedConversationUrl,
         async (message) => {
@@ -1000,6 +999,7 @@ interface GenerationPageState {
   videoUrls: string[];
   visibleVideoCount: number;
   playableVideoCount: number;
+  videoCardCount: number;
 }
 
 interface GenerationResult {
@@ -1014,6 +1014,7 @@ async function waitForGenerationResult(
   baselineText: string,
   baselineVideoUrls: string[],
   baselinePlayableVideoCount: number,
+  baselineVideoCardCount: number,
   prompt: string,
   preferredConversationUrl: string | null,
   onProgress: (message: string) => Promise<void> | void
@@ -1048,23 +1049,21 @@ async function waitForGenerationResult(
       0,
       pageState.playableVideoCount - baselinePlayableVideoCount
     );
+    const newVideoCardCount = Math.max(0, pageState.videoCardCount - baselineVideoCardCount);
     const completionTextPresent = hasNewGenerationCompletion(pageState.pageText, baselineText);
     if (completionTextPresent && !completionTextSeenAt) {
       completionTextSeenAt = Date.now();
     }
-    // Doubao renders the "视频生成好了" text before the finished video card
-    // appears. Copying the share link in that window yields a thread URL
-    // without the video, so prefer to wait briefly for a video element. If the
-    // card never materializes within the grace window, fall back to the text
-    // signal rather than blocking the task forever.
+    // Doubao renders the completion text before the finished card. Do not share
+    // until a new video card is present; a text-only result is not shareable.
     const generated = isGenerationReadyForShare({
       completionTextPresent,
       hasNewVideoSource,
       newVideoCount,
       newPlayableVideoCount,
+      newVideoCardCount,
       completionTextSeenAt,
-      now: Date.now(),
-      graceMs: VIDEO_CARD_GRACE_MS
+      now: Date.now()
     });
 
     if (generated) {
@@ -1154,6 +1153,16 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
       const isDoubaoGenerationComplete = ${isDoubaoGenerationComplete.toString()};
       const isDoubaoPromptRewritePage = ${isDoubaoPromptRewritePage.toString()};
       const videos = Array.from(document.querySelectorAll("video")).filter(visible);
+      const videoCardImages = Array.from(document.querySelectorAll("img")).filter((image) => {
+        if (!visible(image)) return false;
+        const source = [
+          image.currentSrc,
+          image.src,
+          image.getAttribute("src"),
+          image.getAttribute("data-src")
+        ].filter(Boolean).join(" ");
+        return /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(source);
+      });
       const videoSourceLists = videos.map((video) => [
         video.currentSrc,
         video.src,
@@ -1180,7 +1189,8 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
         directVideoUrl: videoUrls[videoUrls.length - 1] || null,
         videoUrls,
         visibleVideoCount: videos.length,
-        playableVideoCount
+        playableVideoCount,
+        videoCardCount: videos.length + videoCardImages.length
       };
     })()
   `);
@@ -1274,8 +1284,12 @@ async function findGeneratedConversationAndCopyShare(
     if (!matchedPrompt) continue;
     promptMatchCount += 1;
 
-    const pageState = await inspectGenerationPage(win);
+    const pageState = await waitForGeneratedVideoCard(win, VIDEO_CARD_WAIT_MS);
     if (!pageState.generated || pageState.failed) continue;
+    if (pageState.videoCardCount <= 0) {
+      shareFailureReason = "匹配对话已完成，但视频卡片仍未渲染";
+      continue;
+    }
     generatedMatchCount += 1;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1301,6 +1315,17 @@ async function findGeneratedConversationAndCopyShare(
     generatedMatchCount,
     shareFailureReason
   };
+}
+
+async function waitForGeneratedVideoCard(win: BrowserWindow, timeoutMs: number) {
+  const startedAt = Date.now();
+  let state = await inspectGenerationPage(win);
+  while (Date.now() - startedAt < timeoutMs) {
+    if (state.failureMessage || (state.generated && state.videoCardCount > 0)) return state;
+    await wait(500);
+    state = await inspectGenerationPage(win);
+  }
+  return state;
 }
 
 async function tryCopyShareLink(win: BrowserWindow) {
@@ -1522,7 +1547,7 @@ async function waitForClipboardShareUrl(timeoutMs = CLIPBOARD_WAIT_MS) {
 }
 
 async function primeGeneratedVideoCard(win: BrowserWindow) {
-  const point = await runPageScript<{ x: number; y: number } | null>(win, `
+  const revealed = await runPageScript<boolean>(win, `
     (() => {
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
@@ -1542,20 +1567,18 @@ async function primeGeneratedVideoCard(win: BrowserWindow) {
             el.getAttribute("src"),
             el.getAttribute("data-src")
           ].filter(Boolean).join(" ");
-          return { rect, source };
+          return { el, rect, source };
         })
         .filter((item) => /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(item.source))
         .sort((a, b) => b.rect.bottom - a.rect.bottom);
       const target = posters[0];
-      return target ? {
-        x: Math.round(target.rect.left + target.rect.width / 2),
-        y: Math.round(target.rect.top + target.rect.height / 2)
-      } : null;
+      if (!target) return false;
+      target.el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      target.el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+      return true;
     })()
   `);
-  if (!point) return false;
-
-  await sendMouseClick(win, point.x, point.y);
+  if (!revealed) return false;
   const startedAt = Date.now();
   while (Date.now() - startedAt < 8000) {
     await wait(500);
@@ -1653,8 +1676,15 @@ async function inspectShareSelection(win: BrowserWindow) {
 }
 
 async function openShareSelection(win: BrowserWindow) {
-  // Doubao currently labels the video-card entry as “分享图片”. It is the
-  // share entry for the selected media, not an image-only fallback.
+  const cardSharePoint = await waitForVideoCardSharePoint(win, 5000);
+  if (cardSharePoint) {
+    await sendMouseClick(win, cardSharePoint.x, cardSharePoint.y);
+    if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
+    await sendKeyboard(win, "ESC", undefined, 250);
+  }
+
+  // Some Doubao builds label the video-card entry as “分享图片”. It is the
+  // share entry for the current media card, not a page-level share action.
   const sharePoint = await waitForTextControlPoint(win, ["分享图片", "分享"], [], 1800);
   if (sharePoint) {
     await sendMouseClick(win, sharePoint.x, sharePoint.y);
@@ -1684,6 +1714,85 @@ async function openShareSelection(win: BrowserWindow) {
   }
 
   return false;
+}
+
+async function waitForVideoCardSharePoint(win: BrowserWindow, timeoutMs: number) {
+  const startedAt = Date.now();
+  let point = await findVideoCardSharePoint(win);
+  while (!point && Date.now() - startedAt < timeoutMs) {
+    await wait(180);
+    point = await findVideoCardSharePoint(win);
+  }
+  return point;
+}
+
+async function findVideoCardSharePoint(win: BrowserWindow) {
+  return runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4
+          && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const textOf = (el) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+      const media = Array.from(document.querySelectorAll("video, img"))
+        .filter(visible)
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          const source = [
+            el.currentSrc,
+            el.src,
+            el.getAttribute("src"),
+            el.getAttribute("data-src"),
+            el.getAttribute("data-video-url"),
+            el.getAttribute("data-download-url")
+          ].filter(Boolean).join(" ");
+          return { el, rect, source };
+        })
+        .filter((item) => /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(item.source))
+        .sort((a, b) => b.rect.bottom - a.rect.bottom)[0];
+      if (!media) return null;
+
+      let ancestor = media.el.parentElement;
+      for (let level = 0; ancestor && level < 9; level += 1, ancestor = ancestor.parentElement) {
+        const controls = Array.from(ancestor.querySelectorAll('button, [role="button"], [tabindex], [aria-label], [title]'))
+          .filter(visible)
+          .map((el) => {
+            const rect = el.getBoundingClientRect();
+            return { el, rect, text: textOf(el) };
+          })
+          .filter((item) => item.rect.width <= 240 && item.rect.height <= 100
+            && item.rect.bottom >= media.rect.top - 100
+            && item.rect.top <= media.rect.bottom + 180);
+        const labeled = controls
+          .filter((item) => /分享/.test(item.text) && !/下载|电脑版/.test(item.text))
+          .sort((a, b) => Number(/分享图片|分享/.test(b.text)) - Number(/分享图片|分享/.test(a.text)));
+        if (labeled[0]) {
+          const rect = labeled[0].rect;
+          return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+        }
+
+        const iconControls = controls
+          .filter((item) => !item.text && item.rect.width <= 64 && item.rect.height <= 64)
+          .sort((a, b) => a.rect.left - b.rect.left);
+        const unique = [];
+        for (const item of iconControls) {
+          if (!unique.some((existing) => Math.abs(existing.rect.left - item.rect.left) < 8)) unique.push(item);
+        }
+        if (unique.length >= 3) {
+          const target = unique[unique.length - 3].rect;
+          return { x: Math.round(target.left + target.width / 2), y: Math.round(target.top + target.height / 2) };
+        }
+      }
+      return null;
+    })()
+  `);
 }
 
 async function findTextControlPoint(win: BrowserWindow, keywords: string[], excluded: string[] = []) {

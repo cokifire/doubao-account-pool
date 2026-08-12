@@ -76,6 +76,7 @@ export interface GenerationReadyInput {
   hasNewVideoSource: boolean;
   newVideoCount: number;
   newPlayableVideoCount?: number;
+  newVideoCardCount?: number;
   completionTextSeenAt: number;
   now: number;
   graceMs?: number;
@@ -84,17 +85,16 @@ export interface GenerationReadyInput {
 /**
  * Decides whether a finished Doubao video is safe to share. Doubao renders the
  * "视频生成好了" text before the finished video card appears; copying the share
- * link in that window yields a thread URL without the video. Prefer to wait for
- * a real video element, falling back to the text signal after `graceMs`.
+ * link in that window yields a thread URL without the video. A completion
+ * message alone is never sufficient: the current task must have a new card.
  */
 export function isGenerationReadyForShare(input: GenerationReadyInput) {
   if (!input.completionTextPresent) return false;
   const videoReady = input.hasNewVideoSource
     || input.newVideoCount > 0
-    || (input.newPlayableVideoCount || 0) > 0;
-  if (videoReady) return true;
-  const graceMs = input.graceMs ?? 15000;
-  return input.completionTextSeenAt > 0 && input.now - input.completionTextSeenAt >= graceMs;
+    || (input.newPlayableVideoCount || 0) > 0
+    || (input.newVideoCardCount || 0) > 0;
+  return videoReady;
 }
 
 export function extractDoubaoFailureMessage(pageText: string) {

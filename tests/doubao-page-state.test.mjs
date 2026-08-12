@@ -158,10 +158,13 @@ test('waits for a video element before treating the result as share-ready', () =
   assert.equal(isGenerationReadyForShare({ ...base, newVideoCount: 1, now: 3000 }), true)
   // A playable blob/object URL video is also ready even without an HTTP source.
   assert.equal(isGenerationReadyForShare({ ...base, newPlayableVideoCount: 1, now: 3000 }), true)
+  // The current Doubao build renders a video poster as an image before the
+  // playable video element exists; the new card is sufficient to share.
+  assert.equal(isGenerationReadyForShare({ ...base, newVideoCardCount: 1, now: 3000 }), true)
   // Stale videos from earlier tasks do not count.
   assert.equal(isGenerationReadyForShare({ ...base, newVideoCount: 0, now: 3000 }), false)
-  // After the grace window the text signal alone is accepted as a fallback.
-  assert.equal(isGenerationReadyForShare({ ...base, now: 17000 }), true)
+  // Completion text alone is never accepted as a share-ready result.
+  assert.equal(isGenerationReadyForShare({ ...base, now: 17000 }), false)
   // No completion text means never ready, even with videos on the page.
   assert.equal(isGenerationReadyForShare({ ...base, completionTextPresent: false, newVideoCount: 1, now: 17000 }), false)
   // Completion text seen but grace not yet elapsed still waits.
