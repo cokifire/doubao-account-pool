@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import net from "node:net";
 import { app, BrowserWindow, ipcMain, session } from "electron";
 import log from "electron-log/main.js";
 import { AppDatabase } from "./database.js";
@@ -27,7 +28,33 @@ let db: AppDatabase;
 let executor: DoubaoExecutor;
 let apiServer: LocalApiServer;
 
-const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
+// 在某些环境下（例如 npm-run-all + cross-env 的并行组合）
+// VITE_DEV_SERVER_URL 不会被传到 electron 子进程，导致主窗口回落到
+// `loadFile(dist/index.html)` 而显示空白。这里加一个兜底：环境变量缺失时，
+// 探测 5173 端口是否被 Vite 占用，仍然当作 dev 模式加载。
+async function probeViteDevServer(host = "127.0.0.1", port = 5173, timeoutMs = 500): Promise<string | null> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let done = false;
+    const finish = (url: string | null) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve(url);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(`http://${host}:${port}`));
+    socket.once("error", () => finish(null));
+    socket.once("timeout", () => finish(null));
+  });
+}
+
+const envUrl = process.env.VITE_DEV_SERVER_URL;
+const probedUrl = envUrl && envUrl.trim().length > 0 ? envUrl : await probeViteDevServer();
+const isDev = Boolean(probedUrl);
+if (isDev) {
+  process.env.VITE_DEV_SERVER_URL = probedUrl!;
+}
 
 class LocalApiServer {
   private server: Server | null = null;
@@ -307,7 +334,6 @@ function createMainWindow() {
 
   if (isDev) {
     void mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL!);
-    mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
     void mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
   }
@@ -339,13 +365,20 @@ async function detectLoginStatus(accountId: number) {
 
   const accountSession = session.fromPartition(account.partition);
   const cookies = await accountSession.cookies.get({ url: "https://www.doubao.com" });
+
+  // 真正登录后才会写入的会话标识 cookie（未登录状态不含这些）
+  const hasSessionCookie = cookies.some((c) =>
+    /^(sessionid|sessionid_ss|sid_tt|sid_guard|uid_tt|uid_tt_ss)$/i.test(c.name)
+  );
+
   const activeRequest = db.listApiRequests(1000).some((request) =>
     request.accountId === accountId && (request.status === "accepted" || request.status === "running")
   );
+
   return db.updateAccount({
     id: accountId,
-    loginStatus: cookies.length > 0 ? "logged_in" : "logged_out",
-    currentStatus: cookies.length > 0
+    loginStatus: hasSessionCookie ? "logged_in" : "logged_out",
+    currentStatus: hasSessionCookie
       ? activeRequest
         ? "busy"
         : "idle"
