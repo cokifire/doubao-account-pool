@@ -225,7 +225,10 @@ async function refresh() {
   apiRequests.value = requests;
   operationLogs.value = actions;
   apiStatus.value = status;
-  Object.assign(settingsForm, settings);
+  // 在配置管理标签页时不要覆盖表单，避免未保存的输入（如去水印 Token）被自动刷新清空
+  if (activeTab.value !== "settings") {
+    Object.assign(settingsForm, settings);
+  }
   } finally {
     refreshInFlight = false;
   }
@@ -327,7 +330,12 @@ async function saveSettings() {
 }
 
 async function restartApiServer() {
-  apiStatus.value = await window.doubaoManager.apiServer.restart();
+  try {
+    apiStatus.value = await window.doubaoManager.apiServer.restart();
+    await refresh();
+  } catch (error) {
+    console.error("重启 API 服务失败", error);
+  }
 }
 
 async function clearLogs() {

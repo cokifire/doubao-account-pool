@@ -468,7 +468,22 @@ function registerIpc() {
   });
 
   ipcMain.handle("api-server:status", () => apiServer.getStatus());
-  ipcMain.handle("api-server:restart", async () => apiServer.applySettings(db.getSettings()));
+  ipcMain.handle("api-server:restart", async () => {
+    try {
+      const status = await apiServer.applySettings(db.getSettings());
+      recordOperation({
+        action: "重启 API 服务",
+        status: status.running ? "success" : "failed",
+        message: status.message
+      });
+      notifyDataChanged();
+      return status;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      recordOperation({ action: "重启 API 服务", status: "failed", message });
+      throw error;
+    }
+  });
 
   ipcMain.handle("api-requests:list", (_event, limit?: number) => db.listApiRequests(limit || 100));
   ipcMain.handle("api-requests:clear", () => {
