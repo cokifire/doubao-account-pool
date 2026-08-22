@@ -17,6 +17,10 @@ export interface Account {
   lastUsedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  userAgent: string;
+  hardwareConcurrency: number;
+  deviceMemory: number;
+  platform: string;
 }
 
 export interface AccountCreateInput {

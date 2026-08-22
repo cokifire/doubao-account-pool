@@ -16,6 +16,7 @@ import type {
   OperationLog,
   OperationLogCreateInput
 } from "./types.js";
+import { generateFingerprint } from "./fingerprint.js";
 
 const now = () => new Date().toISOString();
 const OPERATION_LOG_RETENTION_DAYS = 3;
@@ -135,14 +136,18 @@ export class AppDatabase {
         quota_used_today AS quotaUsedToday,
         last_used_at AS lastUsedAt,
         created_at AS createdAt,
-        updated_at AS updatedAt
+        updated_at AS updatedAt,
+        user_agent AS userAgent,
+        hardware_concurrency AS hardwareConcurrency,
+        device_memory AS deviceMemory,
+        platform AS platform
       FROM accounts
       ORDER BY id ASC
     `).all() as Account[];
   }
 
   getAccount(id: number): Account | undefined {
-    return this.db.prepare(`
+    const account = this.db.prepare(`
       SELECT
         id,
         name,
@@ -155,10 +160,25 @@ export class AppDatabase {
         quota_used_today AS quotaUsedToday,
         last_used_at AS lastUsedAt,
         created_at AS createdAt,
-        updated_at AS updatedAt
+        updated_at AS updatedAt,
+        user_agent AS userAgent,
+        hardware_concurrency AS hardwareConcurrency,
+        device_memory AS deviceMemory,
+        platform AS platform
       FROM accounts
       WHERE id = ?
     `).get(id) as Account | undefined;
+    if (!account) return undefined;
+    if (!account.userAgent || !account.platform) {
+      const fp = generateFingerprint(account.id);
+      this.db.prepare(`
+        UPDATE accounts
+        SET user_agent = ?, hardware_concurrency = ?, device_memory = ?, platform = ?
+        WHERE id = ? AND (user_agent = '' OR platform = '')
+      `).run(fp.userAgent, fp.hardwareConcurrency, fp.deviceMemory, fp.platform, account.id);
+      return { ...account, ...fp };
+    }
+    return account;
   }
 
   createAccount(input: AccountCreateInput = {}): Account {
@@ -192,7 +212,16 @@ export class AppDatabase {
       timestamp
     );
 
-    return this.getAccount(Number(result.lastInsertRowid))!;
+    const id = Number(result.lastInsertRowid);
+    // 为每个账号生成固定设备指纹（长期不变，更像同一台固定设备）。
+    const fp = generateFingerprint(id);
+    this.db.prepare(`
+      UPDATE accounts
+      SET user_agent = ?, hardware_concurrency = ?, device_memory = ?, platform = ?
+      WHERE id = ?
+    `).run(fp.userAgent, fp.hardwareConcurrency, fp.deviceMemory, fp.platform, id);
+
+    return this.getAccount(id)!;
   }
 
   updateAccount(input: AccountUpdateInput): Account {
@@ -644,6 +673,10 @@ export class AppDatabase {
     this.addColumnIfMissing("accounts", "fast_daily_limit", "INTEGER NOT NULL DEFAULT 3");
     this.addColumnIfMissing("accounts", "fast_remaining", "INTEGER NOT NULL DEFAULT 3");
     this.addColumnIfMissing("accounts", "fast_used_today", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("accounts", "user_agent", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("accounts", "hardware_concurrency", "INTEGER NOT NULL DEFAULT 8");
+    this.addColumnIfMissing("accounts", "device_memory", "INTEGER NOT NULL DEFAULT 8");
+    this.addColumnIfMissing("accounts", "platform", "TEXT NOT NULL DEFAULT 'Win32'");
 
     this.db.prepare(`
       UPDATE accounts

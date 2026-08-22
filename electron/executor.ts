@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { BrowserWindow, clipboard } from "electron";
+import { BrowserWindow, clipboard, session, app } from "electron";
 import type { AppDatabase } from "./database.js";
 import { AccountTaskScheduler } from "./account-scheduler.js";
+import { buildFingerprintPreloadScript } from "./fingerprint.js";
 import {
   extractDoubaoConversationUrl,
   extractDoubaoFailureMessage,
@@ -135,7 +136,7 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
-      win = this.createExecutionWindow(account, settings);
+      win = await this.createExecutionWindow(account, settings);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
@@ -223,7 +224,7 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
-      win = this.createExecutionWindow(account, settings);
+      win = await this.createExecutionWindow(account, settings);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
@@ -463,8 +464,18 @@ export class DoubaoExecutor {
     });
   }
 
-  private createExecutionWindow(account: Account, settings: AppSettings) {
+  private async createExecutionWindow(account: Account, settings: AppSettings) {
     const titleName = account.remark || account.name;
+
+    // 应用该账号固定的设备指纹（UA + 基础硬件参数），与 partition 一一对应。
+    const ses = session.fromPartition(account.partition);
+    ses.setUserAgent(account.userAgent);
+    const preloadDir = path.join(app.getPath("userData"), "fingerprint-preloads");
+    await fs.mkdir(preloadDir, { recursive: true });
+    const preloadPath = path.join(preloadDir, `${account.id}.cjs`);
+    await fs.writeFile(preloadPath, buildFingerprintPreloadScript(account), "utf-8");
+    ses.setPreloads([preloadPath]);
+
     return new BrowserWindow({
       width: 1320,
       height: 860,

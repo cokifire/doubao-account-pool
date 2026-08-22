@@ -9,7 +9,9 @@ import log from "electron-log/main.js";
 import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
 import { toPublicApiRequest } from "./public-api.js";
+import { buildFingerprintPreloadScript } from "./fingerprint.js";
 import type {
+  Account,
   AccountUpdateInput,
   ApiRequest,
   ApiServerStatus,
@@ -27,6 +29,19 @@ let mainWindow: BrowserWindow | null = null;
 let db: AppDatabase;
 let executor: DoubaoExecutor;
 let apiServer: LocalApiServer;
+
+// 为每个账号的 partition session 应用固定的设备指纹（UA + 基础硬件参数）。
+// 每个 persist: partition 拥有独立 session，因此指纹按账号隔离、互不相同。
+// timezone / locale / language 保持 Chromium 默认，不做改动。
+const fingerprintPreloadDir = path.join(app.getPath("userData"), "fingerprint-preloads");
+async function applyAccountFingerprint(account: Account): Promise<void> {
+  const ses = session.fromPartition(account.partition);
+  ses.setUserAgent(account.userAgent);
+  const preloadPath = path.join(fingerprintPreloadDir, `${account.id}.cjs`);
+  await fs.mkdir(fingerprintPreloadDir, { recursive: true });
+  await fs.writeFile(preloadPath, buildFingerprintPreloadScript(account), "utf-8");
+  ses.setPreloads([preloadPath]);
+}
 
 // 在某些环境下（例如 npm-run-all + cross-env 的并行组合）
 // VITE_DEV_SERVER_URL 不会被传到 electron 子进程，导致主窗口回落到
@@ -342,6 +357,9 @@ function createMainWindow() {
 function createDoubaoWindow(accountId: number) {
   const account = db.getAccount(accountId);
   if (!account) throw new Error("Account not found");
+
+  // 应用该账号固定的设备指纹（UA + 基础硬件参数），与 partition 一一对应。
+  void applyAccountFingerprint(account);
 
   const titleName = account.remark || account.name;
   const win = new BrowserWindow({
