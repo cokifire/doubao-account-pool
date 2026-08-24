@@ -17,7 +17,11 @@ const USER_AGENTS = [
 ] as const;
 
 function pick<T>(pool: ReadonlyArray<T>, seed: number): T {
-  return pool[seed % pool.length];
+  const len = pool.length;
+  // 取正模，避免 seed 为负数（如 seed >> 7 溢出为 32 位有符号整数）时
+  // pool[负索引] 返回 undefined，进而被绑定成 NULL 触发 NOT NULL 约束。
+  const index = ((Math.trunc(seed) % len) + len) % len;
+  return pool[index];
 }
 
 // 用账号 id 作为稳定种子，保证同一账号每次生成都一致（固定指纹）。

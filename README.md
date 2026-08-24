@@ -10,7 +10,7 @@
 - 登录持久化：关闭软件后保留各账号登录状态，下次启动可继续使用。
 - 共享额度管理：默认每个账号每日 10 点额度，Mini 消耗 2 点，Fast 消耗 3 点，均可在配置页调整。
 - 账号池调度：自动选择已登录、空闲且额度充足的账号执行请求。
-- 后台视频生成：支持文本提示词和参考图片，跟踪等待、执行、成功和失败状态。
+- 后台视频生成：支持文本提示词和参考图片（最多 10 张，与豆包界面一致），跟踪等待、执行、成功和失败状态。
 - 严格结果输出：只有取得经过验证的真实 MP4 地址或本地 MP4 文件后，任务才会返回 `success`。
 - 可选去水印：可配置第三方解析接口；只在取得并验证 MP4 后返回 `success`，解析失败或未取得 MP4 时返回 `failed`。
 - 本地接口服务：默认监听 `127.0.0.1:17888`，支持 API Key、状态查询和回调地址。
@@ -47,6 +47,18 @@ curl -X POST http://127.0.0.1:17888/api/generate \
   -F "prompt=生成一段 10 秒科普视频" \
   -F "referenceImage=@/path/to/reference.png" \
   -F "callbackUrl=http://127.0.0.1:3000/doubao/callback"
+```
+
+参考图最多支持 10 张（与豆包界面一致）。可重复提交 `referenceImage` 字段、传 `referenceImagePaths` 数组（本机绝对路径）或 `referenceImageUrl` 数组（可下载 URL），例如同时上传多张：
+
+```bash
+curl -X POST http://127.0.0.1:17888/api/generate \
+  -H "Authorization: Bearer local-doubao-key" \
+  -F "model=seedance_2_0_mini" \
+  -F "prompt=结合多张参考图生成 10 秒动画" \
+  -F "referenceImage=@/path/to/ref1.png" \
+  -F "referenceImage=@/path/to/ref2.png" \
+  -F "referenceImage=@/path/to/ref3.png"
 ```
 
 提交成功会先返回 `accepted`，可通过下面的接口查询：

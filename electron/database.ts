@@ -169,13 +169,22 @@ export class AppDatabase {
       WHERE id = ?
     `).get(id) as Account | undefined;
     if (!account) return undefined;
-    if (!account.userAgent || !account.platform) {
+    // 设备指纹在 migrate() 的 backfillFingerprints() 中已无条件补齐，
+    // 这里仅做兜底，避免极旧数据触发 NOT NULL 约束。
+    const needsFp = !account.userAgent || account.userAgent === "" || !account.platform || account.platform === "";
+    if (needsFp) {
       const fp = generateFingerprint(account.id);
       this.db.prepare(`
         UPDATE accounts
         SET user_agent = ?, hardware_concurrency = ?, device_memory = ?, platform = ?
-        WHERE id = ? AND (user_agent = '' OR platform = '')
-      `).run(fp.userAgent, fp.hardwareConcurrency, fp.deviceMemory, fp.platform, account.id);
+        WHERE id = ? AND (user_agent = '' OR user_agent IS NULL OR platform = '' OR platform IS NULL)
+      `).run(
+        fp.userAgent || "",
+        fp.hardwareConcurrency ?? 8,
+        fp.deviceMemory ?? 8,
+        fp.platform || "Win32",
+        account.id
+      );
       return { ...account, ...fp };
     }
     return account;
@@ -687,6 +696,45 @@ export class AppDatabase {
         quota_remaining = CASE WHEN quota_remaining = 10 AND (mini_remaining + fast_remaining) != 8 THEN mini_remaining + fast_remaining ELSE quota_remaining END,
         quota_used_today = CASE WHEN quota_used_today = 0 AND (mini_used_today + fast_used_today) > 0 THEN mini_used_today + fast_used_today ELSE quota_used_today END
     `).run();
+
+    // 回填空设备指纹列（旧库中可能存在 NULL 或空值，触发 NOT NULL 约束）。
+    this.backfillFingerprints();
+  }
+
+  // 为每个账号补齐固定的设备指纹，保证 user_agent / platform 非空且
+  // hardware_concurrency / device_memory 不为 NULL（避免 NOT NULL 约束失败）。
+  private backfillFingerprints() {
+    const rows = this.db.prepare(
+      "SELECT id, user_agent, hardware_concurrency, device_memory, platform FROM accounts"
+    ).all() as Array<{
+      id: number;
+      user_agent: string | null;
+      hardware_concurrency: number | null;
+      device_memory: number | null;
+      platform: string | null;
+    }>;
+    const update = this.db.prepare(`
+      UPDATE accounts
+      SET user_agent = ?, hardware_concurrency = ?, device_memory = ?, platform = ?
+      WHERE id = ?
+    `);
+    for (const row of rows) {
+      const missingText =
+        !row.user_agent || row.user_agent === "" || !row.platform || row.platform === "";
+      const missingNumber =
+        row.hardware_concurrency === null || row.hardware_concurrency === undefined ||
+        row.device_memory === null || row.device_memory === undefined;
+      if (!missingText && !missingNumber) continue;
+      const fp = generateFingerprint(row.id);
+      // 兜底：即便指纹生成异常，也绝不允许写入 NULL（否则会触发 NOT NULL 约束）。
+      update.run(
+        fp.userAgent || "",
+        row.hardware_concurrency ?? fp.hardwareConcurrency ?? 8,
+        row.device_memory ?? fp.deviceMemory ?? 8,
+        fp.platform || "Win32",
+        row.id
+      );
+    }
   }
 
   private ensureApiRequestColumns() {

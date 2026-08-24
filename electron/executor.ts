@@ -1694,14 +1694,11 @@ async function openShareSelection(win: BrowserWindow) {
     await sendKeyboard(win, "ESC", undefined, 250);
   }
 
-  // Some Doubao builds label the video-card entry as “分享图片”. It is the
-  // share entry for the current media card, not a page-level share action.
-  const sharePoint = await waitForTextControlPoint(win, ["分享图片", "分享"], [], 1800);
-  if (sharePoint) {
-    await sendMouseClick(win, sharePoint.x, sharePoint.y);
-    if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
-  }
-
+  // Prefer the header "..." (more) menu share entry. On Doubao builds that use
+  // session-level sharing, this menu is the only path that produces a
+  // thread/... link embedding the current video resource. A page-level "分享"
+  // text control often maps to a message/session chat/... share instead, so it
+  // is tried only as a later fallback.
   const menuPoint = await findOverflowMenuPoint(win);
   if (menuPoint) {
     await sendMouseClick(win, menuPoint.x, menuPoint.y);
@@ -1711,8 +1708,16 @@ async function openShareSelection(win: BrowserWindow) {
       if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
     }
     // A wrong header candidate can open an unrelated popover. Close it before
-    // trying the icon-only fallback so the next click is not swallowed.
+    // trying the next fallback so the next click is not swallowed.
     await sendKeyboard(win, "ESC", undefined, 250);
+  }
+
+  // Some Doubao builds label the video-card entry as “分享图片”. It is the
+  // share entry for the current media card, not a page-level share action.
+  const sharePoint = await waitForTextControlPoint(win, ["分享图片", "分享"], [], 1800);
+  if (sharePoint) {
+    await sendMouseClick(win, sharePoint.x, sharePoint.y);
+    if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
   }
 
   // On some Doubao builds the message toolbar is icon-only. Its action order is
