@@ -532,7 +532,7 @@ onMounted(async () => {
   }, 3000);
   statusCheckTimer = window.setInterval(() => {
     void autoCheckAccountStatuses().catch((error) => console.error("自动检测账号状态失败", error));
-  }, 30000);
+  }, 300000);
 });
 
 onBeforeUnmount(() => {
