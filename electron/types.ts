@@ -14,6 +14,7 @@ export interface Account {
   dailyQuotaLimit: number;
   quotaRemaining: number;
   quotaUsedToday: number;
+  lastQuotaResetDate: string | null;
   lastUsedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -73,6 +74,7 @@ export interface ApiRequest {
   message: string;
   prompt: string;
   referenceImagePath: string | null;
+  referenceImagePaths: string[];
   removeWatermark: boolean;
   callbackUrl: string | null;
   doubaoThreadUrl: string | null;
@@ -93,6 +95,7 @@ export interface ApiRequestCreateInput {
   message?: string;
   prompt: string;
   referenceImagePath?: string | null;
+  referenceImagePaths?: string[];
   removeWatermark?: boolean;
   callbackUrl?: string | null;
 }
@@ -142,6 +145,7 @@ export interface GenerateRequestBody {
   model?: DoubaoModel;
   prompt: string;
   referenceImagePath?: string | null;
+  referenceImagePaths?: string[];
   referenceImageUrl?: string | null;
   removeWatermark?: boolean;
   callbackUrl?: string | null;

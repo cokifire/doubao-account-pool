@@ -19,6 +19,28 @@ import type {
 import { generateFingerprint } from "./fingerprint.js";
 
 const now = () => new Date().toISOString();
+
+/** 本地日期 YYYY-MM-DD（按运行时时区，而非 UTC）。 */
+function todayLocalDate(): string {
+  return toLocalDateStr(new Date());
+}
+
+/** 将 Date 转为本地日期 YYYY-MM-DD。 */
+function toLocalDateStr(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+/** 解析 dailyResetTime（如 "00:00"、"08:30"）为小时数，非法值回退到 0。 */
+function parseResetHour(value: string | undefined): number {
+  if (!value) return 0;
+  const parts = value.split(":");
+  const hour = Number(parts[0]);
+  if (!Number.isFinite(hour) || hour < 0 || hour > 23) return 0;
+  return Math.floor(hour);
+}
 const OPERATION_LOG_RETENTION_DAYS = 3;
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -65,6 +87,7 @@ export class AppDatabase {
         daily_quota_limit INTEGER NOT NULL DEFAULT 10,
         quota_remaining INTEGER NOT NULL DEFAULT 10,
         quota_used_today INTEGER NOT NULL DEFAULT 0,
+        last_quota_reset_date TEXT,
         last_used_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -86,6 +109,7 @@ export class AppDatabase {
         message TEXT NOT NULL DEFAULT '',
         prompt TEXT NOT NULL,
         reference_image_path TEXT,
+        reference_image_paths TEXT,
         remove_watermark INTEGER NOT NULL DEFAULT 1,
         callback_url TEXT,
         doubao_thread_url TEXT,
@@ -134,6 +158,7 @@ export class AppDatabase {
         daily_quota_limit AS dailyQuotaLimit,
         quota_remaining AS quotaRemaining,
         quota_used_today AS quotaUsedToday,
+        last_quota_reset_date AS lastQuotaResetDate,
         last_used_at AS lastUsedAt,
         created_at AS createdAt,
         updated_at AS updatedAt,
@@ -158,6 +183,7 @@ export class AppDatabase {
         daily_quota_limit AS dailyQuotaLimit,
         quota_remaining AS quotaRemaining,
         quota_used_today AS quotaUsedToday,
+        last_quota_reset_date AS lastQuotaResetDate,
         last_used_at AS lastUsedAt,
         created_at AS createdAt,
         updated_at AS updatedAt,
@@ -277,6 +303,7 @@ export class AppDatabase {
   }
 
   resetAccountQuota(id: number): Account {
+    const today = todayLocalDate();
     this.db.prepare(`
       UPDATE accounts
       SET
@@ -286,13 +313,15 @@ export class AppDatabase {
         fast_used_today = 0,
         quota_remaining = daily_quota_limit,
         quota_used_today = 0,
+        last_quota_reset_date = ?,
         updated_at = ?
       WHERE id = ?
-    `).run(now(), id);
+    `).run(today, now(), id);
     return this.getAccount(id)!;
   }
 
   resetAllQuotas(): Account[] {
+    const today = todayLocalDate();
     this.db.prepare(`
       UPDATE accounts
       SET
@@ -302,9 +331,43 @@ export class AppDatabase {
         fast_used_today = 0,
         quota_remaining = daily_quota_limit,
         quota_used_today = 0,
+        last_quota_reset_date = ?,
         updated_at = ?
-    `).run(now());
+    `).run(today, now());
     return this.listAccounts();
+  }
+
+  /**
+   * 自动重置跨过每日重置时间点、但当天额度尚未刷新的账号。
+   * 判定规则：以 dailyResetTime 为界，若当前时间尚未到达今日重置时刻，
+   * 则视为仍处于"昨日"的重置周期内（用昨天的日期作比较基准）。
+   * 返回被重置的账号数量。
+   */
+  resetExpiredQuotas(settings: AppSettings): number {
+    const now = new Date();
+    const resetHour = parseResetHour(settings.dailyResetTime);
+    const resetDay = new Date(now);
+    if (now.getHours() < resetHour) {
+      resetDay.setDate(resetDay.getDate() - 1);
+    }
+    const resetDayStr = toLocalDateStr(resetDay);
+    const result = this.db
+      .prepare(
+        `UPDATE accounts
+         SET
+           mini_remaining = mini_daily_limit,
+           mini_used_today = 0,
+           fast_remaining = fast_daily_limit,
+           fast_used_today = 0,
+           quota_remaining = daily_quota_limit,
+           quota_used_today = 0,
+           last_quota_reset_date = ?,
+           updated_at = ?
+         WHERE last_quota_reset_date IS NULL
+            OR last_quota_reset_date < ?`
+      )
+      .run(resetDayStr, now.toISOString(), resetDayStr);
+    return result.changes;
   }
 
   findAvailableAccount(model: DoubaoModel): Account | undefined {
@@ -321,6 +384,7 @@ export class AppDatabase {
         daily_quota_limit AS dailyQuotaLimit,
         quota_remaining AS quotaRemaining,
         quota_used_today AS quotaUsedToday,
+        last_quota_reset_date AS lastQuotaResetDate,
         last_used_at AS lastUsedAt,
         created_at AS createdAt,
         updated_at AS updatedAt
@@ -443,6 +507,7 @@ export class AppDatabase {
         api_requests.message,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePaths,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
@@ -473,6 +538,7 @@ export class AppDatabase {
         api_requests.message,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePaths,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
@@ -501,13 +567,14 @@ export class AppDatabase {
         message,
         prompt,
         reference_image_path,
+        reference_image_paths,
         remove_watermark,
         callback_url,
         created_at,
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
@@ -517,6 +584,7 @@ export class AppDatabase {
       input.message || "",
       input.prompt,
       input.referenceImagePath || null,
+      input.referenceImagePaths && input.referenceImagePaths.length ? JSON.stringify(input.referenceImagePaths) : null,
       input.removeWatermark === false ? 0 : 1,
       input.callbackUrl || null,
       timestamp,
@@ -686,6 +754,7 @@ export class AppDatabase {
     this.addColumnIfMissing("accounts", "hardware_concurrency", "INTEGER NOT NULL DEFAULT 8");
     this.addColumnIfMissing("accounts", "device_memory", "INTEGER NOT NULL DEFAULT 8");
     this.addColumnIfMissing("accounts", "platform", "TEXT NOT NULL DEFAULT 'Win32'");
+    this.addColumnIfMissing("accounts", "last_quota_reset_date", "TEXT");
 
     this.db.prepare(`
       UPDATE accounts
@@ -740,6 +809,7 @@ export class AppDatabase {
   private ensureApiRequestColumns() {
     this.addColumnIfMissing("api_requests", "source", "TEXT NOT NULL DEFAULT 'local'");
     this.addColumnIfMissing("api_requests", "reference_image_path", "TEXT");
+    this.addColumnIfMissing("api_requests", "reference_image_paths", "TEXT");
     this.addColumnIfMissing("api_requests", "remove_watermark", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "callback_url", "TEXT");
     this.addColumnIfMissing("api_requests", "doubao_thread_url", "TEXT");
@@ -818,8 +888,21 @@ function isSettingsKey(key: string): key is keyof AppSettings {
 
 function normalizeApiRequest(row: unknown): ApiRequest {
   const request = row as ApiRequest & { removeWatermark: number | boolean };
+  const rawPaths = (row as Record<string, unknown>).referenceImagePaths;
+  let referenceImagePaths: string[] = [];
+  if (typeof rawPaths === "string" && rawPaths.trim()) {
+    try {
+      const parsed = JSON.parse(rawPaths);
+      if (Array.isArray(parsed)) referenceImagePaths = parsed.filter((p): p is string => typeof p === "string");
+    } catch {
+      referenceImagePaths = [];
+    }
+  } else if (Array.isArray(rawPaths)) {
+    referenceImagePaths = rawPaths.filter((p): p is string => typeof p === "string");
+  }
   return {
     ...request,
+    referenceImagePaths,
     removeWatermark: Boolean(request.removeWatermark)
   };
 }

@@ -22,6 +22,9 @@ import type {
 } from "./types.js";
 import { resolveCleanVideoUrl } from "./watermark.js";
 
+const MAX_REFERENCE_IMAGES = 10;
+const MAX_REFERENCE_IMAGE_BYTES = 5 * 1024 * 1024;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -205,6 +208,7 @@ class LocalApiServer {
             message: "没有可用账号，或该模型剩余额度不足",
             prompt,
             referenceImagePath,
+            referenceImagePaths: body.referenceImagePaths || (referenceImagePath ? [referenceImagePath] : []),
             removeWatermark: true,
             callbackUrl: body.callbackUrl
           });
@@ -232,6 +236,7 @@ class LocalApiServer {
             : `已接收，已预扣 ${cost} 额度，自动执行已关闭`,
           prompt,
           referenceImagePath,
+          referenceImagePaths: body.referenceImagePaths || (referenceImagePath ? [referenceImagePath] : []),
           removeWatermark: true,
           callbackUrl: body.callbackUrl
         });
@@ -564,7 +569,7 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
   if (!boundary) throw new Error("multipart boundary is required");
 
   const fields: Record<string, string> = {};
-  let uploadedReferenceImagePath: string | null = null;
+  const uploadedReferenceImagePaths: string[] = [];
   const delimiter = Buffer.from(`--${boundary}`);
 
   for (const rawPart of splitBuffer(buffer, delimiter)) {
@@ -583,30 +588,55 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
     if (!disposition.name) continue;
 
     if (disposition.filename) {
-      if (!uploadedReferenceImagePath && body.length > 0) {
-        uploadedReferenceImagePath = await saveUploadedFile({
-          requestId,
-          fieldName: disposition.name,
-          filename: disposition.filename,
-          contentType: headers["content-type"],
-          bytes: body
-        });
+      if (body.length === 0) continue;
+      if (uploadedReferenceImagePaths.length >= MAX_REFERENCE_IMAGES) {
+        throw new Error(`参考图数量超出限制，最多 ${MAX_REFERENCE_IMAGES} 张`);
       }
+      if (body.length > MAX_REFERENCE_IMAGE_BYTES) {
+        throw new Error(`参考图 ${disposition.filename} 超过单张大小限制 ${MAX_REFERENCE_IMAGE_BYTES / (1024 * 1024)}M`);
+      }
+      const savedPath = await saveUploadedFile({
+        requestId,
+        fieldName: `${disposition.name}-${uploadedReferenceImagePaths.length}`,
+        filename: disposition.filename,
+        contentType: headers["content-type"],
+        bytes: body
+      });
+      uploadedReferenceImagePaths.push(savedPath);
       continue;
     }
 
     fields[disposition.name] = body.toString("utf8");
   }
 
+  const firstPath = uploadedReferenceImagePaths[0] || fields.referenceImagePath || null;
+  const referenceImagePaths = uploadedReferenceImagePaths.length
+    ? uploadedReferenceImagePaths
+    : (splitReferenceImagePaths(fields.referenceImagePaths));
+
   return {
     model: fields.model as DoubaoModel | undefined,
     prompt: fields.prompt || "",
-    referenceImagePath: uploadedReferenceImagePath || fields.referenceImagePath || null,
+    referenceImagePath: firstPath,
+    referenceImagePaths,
     referenceImageUrl: fields.referenceImageUrl || null,
     removeWatermark: parseOptionalBoolean(fields.removeWatermark),
     callbackUrl: fields.callbackUrl || null,
     source: fields.source || "multipart-api"
   };
+}
+
+function splitReferenceImagePaths(raw?: string): string[] {
+  if (!raw) return [];
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) return parsed.filter((p): p is string => typeof p === "string");
+  } catch {
+    // not JSON, treat as comma-separated list
+  }
+  return trimmed.split(",").map((p) => p.trim()).filter(Boolean);
 }
 
 async function prepareReferenceImage(body: GenerateRequestBody, requestId: string) {
@@ -743,6 +773,25 @@ if (!hasSingleInstanceLock) {
     registerIpc();
     await apiServer.applySettings(db.getSettings());
     createMainWindow();
+
+    // 启动卡死任务巡视：自动结束超过 30 分钟无返回数据的 running 任务，
+    // 并清理重启前遗留的卡死任务（如豆包端早已结束但界面仍显示执行中的情况）。
+    executor.startStuckTaskWatcher();
+
+    // 自动每日额度重置：启动时立即检查一次，之后每分钟轮询。
+    const runDailyQuotaReset = () => {
+      try {
+        const resetCount = db.resetExpiredQuotas(db.getSettings());
+        if (resetCount > 0) {
+          log.info(`自动重置了 ${resetCount} 个账号的每日额度`);
+          notifyDataChanged();
+        }
+      } catch (error) {
+        log.error("每日额度自动重置失败:", error);
+      }
+    };
+    runDailyQuotaReset();
+    setInterval(runDailyQuotaReset, 60 * 1000);
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) {

@@ -81,6 +81,11 @@ const callbackQueues = new Map<string, Promise<void>>();
 
 export class DoubaoExecutor {
   private readonly scheduler: AccountTaskScheduler<QueueItem>;
+  // 记录每个正在执行任务对应的浏览器窗口，便于超时/停止时强制关闭。
+  private readonly activeWindows = new Map<string, BrowserWindow>();
+  private stuckTaskTimer: ReturnType<typeof setInterval> | null = null;
+  // 任务运行超过该时长（毫秒）没有任何进度更新，即判定为卡死并自动结束。
+  private readonly stuckTaskTimeoutMs = 30 * 60 * 1000;
 
   constructor(
     private readonly database: AppDatabase,
@@ -98,6 +103,59 @@ export class DoubaoExecutor {
       (error) => console.error("豆包并行执行器异常", error)
     );
   }
+
+  /**
+   * 启动卡死任务巡视：周期性检查数据库中仍处于 running 状态、
+   * 但超过 30 分钟没有任何进度更新的任务（豆包端往往早已结束），
+   * 自动将其标记为失败并退回预扣额度，避免界面永久卡在「执行中」。
+   */
+  startStuckTaskWatcher(intervalMs = 60 * 1000) {
+    if (this.stuckTaskTimer) return;
+    // 启动时立即扫描一次，清理历史遗留的卡死任务。
+    this.scanStuckTasks();
+    this.stuckTaskTimer = setInterval(() => this.scanStuckTasks(), intervalMs);
+  }
+
+  stopStuckTaskWatcher() {
+    if (this.stuckTaskTimer) {
+      clearInterval(this.stuckTaskTimer);
+      this.stuckTaskTimer = null;
+    }
+  }
+
+  private scanStuckTasks() {
+    const now = Date.now();
+    const stuck = this.database
+      .listApiRequests(1000)
+      .filter((request) => {
+        if (request.status !== "running") return false;
+        const updatedAt = Date.parse(request.updatedAt);
+        if (Number.isNaN(updatedAt)) return false;
+        return now - updatedAt > this.stuckTaskTimeoutMs;
+      });
+    for (const request of stuck) {
+      try {
+        this.database.refundQuota(request.accountId!, request.model);
+      } catch {
+        // 额度退回失败不阻断任务结束。
+      }
+      this.database.updateApiRequest({
+        requestId: request.requestId,
+        status: "failed",
+        message: "任务运行超过 30 分钟无返回数据，已自动结束"
+      });
+      this.database.updateAccount({
+        id: request.accountId!,
+        currentStatus: "idle"
+      });
+      // 关闭可能仍然挂起的执行窗口。
+      const win = this.activeWindows.get(request.requestId);
+      if (win && !win.isDestroyed()) win.close();
+      this.activeWindows.delete(request.requestId);
+      console.log(`已自动结束卡死任务 ${request.requestId}（超过 30 分钟无返回）`);
+    }
+  }
+
 
   enqueue(requestId: string) {
     this.enqueueItem(requestId, "generate");
@@ -137,6 +195,7 @@ export class DoubaoExecutor {
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
       win = await this.createExecutionWindow(account, settings);
+      this.activeWindows.set(requestId, win);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
@@ -192,6 +251,7 @@ export class DoubaoExecutor {
       });
       this.onDataChanged();
     } finally {
+      this.activeWindows.delete(requestId);
       if (win && !win.isDestroyed()) win.close();
     }
   }
@@ -225,6 +285,7 @@ export class DoubaoExecutor {
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
       win = await this.createExecutionWindow(account, settings);
+      this.activeWindows.set(requestId, win);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
@@ -361,6 +422,8 @@ export class DoubaoExecutor {
       if (win && !settings.showExecutorWindow && !keepWindowOpen && !win.isDestroyed()) {
         win.close();
       }
+    } finally {
+      this.activeWindows.delete(requestId);
     }
   }
 

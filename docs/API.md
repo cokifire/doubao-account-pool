@@ -35,11 +35,13 @@ Content-Type: multipart/form-data
 | --- | --- | --- |
 | `prompt` | 是 | 视频提示词 |
 | `model` | 否 | `seedance_2_0_mini` 或 `seedance_2_0_fast` |
-| `referenceImage` | 否 | 上传的参考图片文件 |
-| `referenceImagePath` | 否 | 本机参考图片绝对路径 |
+| `referenceImage` | 否 | 上传的参考图片文件，可重复提交多个（作为多参考图传给豆包生成） |
+| `referenceImagePath` | 否 | 本机参考图片绝对路径，可填写多个（JSON 数组或逗号分隔） |
 | `referenceImageUrl` | 否 | 可下载的参考图片 URL |
 | `callbackUrl` | 否 | 状态变化时接收 JSON 的回调地址 |
 | `source` | 否 | 请求来源名称 |
+
+多参考图限制：最多 `10` 张，单张大小不超过 `5MB`。超出任一限制时接口返回 HTTP 400 并提示具体原因。重复提交 `referenceImage` 字段或 `referenceImagePath` 数组（最多 10 项）均会被收集为参考图列表，依次上传至豆包。
 
 生成请求固定执行最终 MP4 结果验证。去水印失败、平台不支持或没有取得可播放 MP4 时，任务状态为 `failed`。
 
