@@ -311,13 +311,16 @@ export class DoubaoExecutor {
       });
       await activateVideoMode(win, request.model);
 
-      if (request.referenceImagePath) {
+      const referenceImagePaths = request.referenceImagePaths && request.referenceImagePaths.length
+        ? request.referenceImagePaths
+        : (request.referenceImagePath ? [request.referenceImagePath] : []);
+      if (referenceImagePaths.length) {
         await this.updateProgress({
           requestId,
           status: "running",
-          message: "正在上传参考图"
+          message: `正在上传参考图（${referenceImagePaths.length} 张）`
         });
-        await uploadReferenceImage(win, request.referenceImagePath);
+        await uploadReferenceImage(win, referenceImagePaths);
       }
 
       await this.updateProgress({
@@ -609,30 +612,36 @@ async function looksLoggedOut(win: BrowserWindow) {
   `);
 }
 
-async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
-  const resolvedPath = path.resolve(imagePath);
-  const stat = await fs.stat(resolvedPath).catch(() => null);
-  if (!stat?.isFile()) {
-    throw new Error(`参考图不存在：${resolvedPath}`);
+async function uploadReferenceImage(win: BrowserWindow, imagePaths: string[]) {
+  const resolvedPaths = imagePaths.map((p) => path.resolve(p));
+  for (const resolvedPath of resolvedPaths) {
+    const stat = await fs.stat(resolvedPath).catch(() => null);
+    if (!stat?.isFile()) {
+      throw new Error(`参考图不存在：${resolvedPath}`);
+    }
   }
 
-  if (await setFirstFileInput(win, resolvedPath)) {
-    await wait(2500);
+  // 豆包上传控件支持批量选择，一次性批量注入所有参考图。
+  // CDP 的 DOM.setFileInputFiles 可直接设置多文件，不受 input 的 multiple 属性限制。
+  const settleWaitMs = 2500 + Math.min(resolvedPaths.length, 10) * 200;
+
+  if (await setFileInputs(win, resolvedPaths)) {
+    await wait(settleWaitMs);
     return;
   }
 
   await clickByKeywords(win, ["上传", "参考图", "图片", "添加图片", "附件", "image", "upload"]);
   await wait(1200);
 
-  if (await setFirstFileInput(win, resolvedPath)) {
-    await wait(2500);
+  if (await setFileInputs(win, resolvedPaths)) {
+    await wait(settleWaitMs);
     return;
   }
 
   throw new Error("没有找到豆包页面的图片上传控件");
 }
 
-async function setFirstFileInput(win: BrowserWindow, filePath: string) {
+async function setFileInputs(win: BrowserWindow, filePaths: string[]) {
   const debug = win.webContents.debugger;
   let attachedHere = false;
   try {
@@ -651,7 +660,7 @@ async function setFirstFileInput(win: BrowserWindow, filePath: string) {
     if (!inputs.nodeIds.length) return false;
     await debug.sendCommand("DOM.setFileInputFiles", {
       nodeId: inputs.nodeIds[0],
-      files: [filePath]
+      files: filePaths
     });
     return true;
   } finally {
