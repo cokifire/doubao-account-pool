@@ -340,7 +340,7 @@ class LocalApiServer {
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
-    width: 1180,
+    width: 1298,
     height: 760,
     minWidth: 980,
     minHeight: 640,
@@ -441,6 +441,11 @@ function registerIpc() {
   ipcMain.handle("accounts:update", (_event, input: AccountUpdateInput) => {
     const account = db.updateAccount(input);
     recordOperation(null, account.id, "修改账号设置", "success", "已保存账号备注和额度设置");
+    return account;
+  });
+  ipcMain.handle("accounts:set-enabled", (_event, id: number, enabled: boolean) => {
+    const account = db.setAccountEnabled(id, Boolean(enabled));
+    recordOperation(null, id, "修改账号状态", "success", enabled ? `已启用 ${account?.partition || id}` : `已禁用 ${account?.partition || id}`);
     return account;
   });
   ipcMain.handle("accounts:delete", async (_event, id: number) => {

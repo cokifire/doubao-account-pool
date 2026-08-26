@@ -256,6 +256,11 @@ async function openAccount(account: Account) {
   await refresh();
 }
 
+async function toggleAccountEnabled(account: Account) {
+  await window.doubaoManager.accounts.setEnabled(account.id, !account.enabled);
+  await refresh();
+}
+
 async function detectAccount(account: Account) {
   await window.doubaoManager.accounts.detectLogin(account.id);
   await refresh();
@@ -458,7 +463,7 @@ function isLoginRequired(account: Account) {
 }
 
 function isAccountAvailable(account: Account) {
-  return account.loginStatus === "logged_in" && account.currentStatus === "idle" && !isQuotaExhausted(account);
+  return account.enabled && account.loginStatus === "logged_in" && account.currentStatus === "idle" && !isQuotaExhausted(account);
 }
 
 function accountStatusLabel(account: Account) {
@@ -668,11 +673,12 @@ onBeforeUnmount(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="account in filteredAccounts" :key="account.id" :class="{ 'quota-exhausted-row': isQuotaExhausted(account) }">
+            <tr v-for="account in filteredAccounts" :key="account.id" :class="{ 'quota-exhausted-row': isQuotaExhausted(account), 'account-disabled-row': !account.enabled }">
               <td class="account-info-cell">
                 <div class="account-name-line">
                   <strong>{{ accountCode(account) }}</strong>
                   <button class="partition-info" type="button" :title="account.partition" aria-label="查看账号隔离分区">i</button>
+                  <span v-if="!account.enabled" class="account-disabled-badge">已禁用</span>
                 </div>
                 <span class="account-remark">{{ account.remark || "未添加备注" }}</span>
               </td>
@@ -699,6 +705,9 @@ onBeforeUnmount(() => {
               <td class="last-used-cell" :title="fullTime(account.lastUsedAt)">{{ formatRelativeTime(account.lastUsedAt) }}</td>
               <td class="account-actions-cell">
                 <div class="row-actions account-actions">
+                  <button class="button compact-button" :class="{ primary: !account.enabled }" @click="toggleAccountEnabled(account)" :title="account.enabled ? '禁用该账号（禁用后不再参与自动分配）' : '启用该账号（可参与自动分配）'">
+                    {{ account.enabled ? "禁用" : "启用" }}
+                  </button>
                   <button class="button primary compact-button" @click="openAccount(account)">打开豆包</button>
                   <button class="button compact-button" @click="detectAccount(account)">检测</button>
                   <div class="action-menu">

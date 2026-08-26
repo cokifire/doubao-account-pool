@@ -9,6 +9,7 @@ export interface Account {
   name: string;
   partition: string;
   remark: string;
+  enabled: boolean;
   loginStatus: LoginStatus;
   currentStatus: AccountRuntimeStatus;
   dailyQuotaLimit: number;
@@ -30,6 +31,7 @@ export interface AccountCreateInput {
 
 export interface AccountUpdateInput {
   id: number;
+  enabled?: boolean;
   remark?: string;
   loginStatus?: LoginStatus;
   currentStatus?: AccountRuntimeStatus;

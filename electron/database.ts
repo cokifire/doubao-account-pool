@@ -183,10 +183,11 @@ export class AppDatabase {
         user_agent AS userAgent,
         hardware_concurrency AS hardwareConcurrency,
         device_memory AS deviceMemory,
-        platform AS platform
+        platform AS platform,
+        enabled AS enabled
       FROM accounts
       ORDER BY id ASC
-    `).all() as Account[];
+    `).all().map(normalizeAccount);
   }
 
   getAccount(id: number): Account | undefined {
@@ -208,7 +209,8 @@ export class AppDatabase {
         user_agent AS userAgent,
         hardware_concurrency AS hardwareConcurrency,
         device_memory AS deviceMemory,
-        platform AS platform
+        platform AS platform,
+        enabled AS enabled
       FROM accounts
       WHERE id = ?
     `).get(id) as Account | undefined;
@@ -229,9 +231,9 @@ export class AppDatabase {
         fp.platform || "Win32",
         account.id
       );
-      return { ...account, ...fp };
+      return normalizeAccount({ ...account, ...fp });
     }
-    return account;
+    return normalizeAccount(account);
   }
 
   createAccount(input: AccountCreateInput = {}): Account {
@@ -316,6 +318,16 @@ export class AppDatabase {
     return this.getAccount(input.id)!;
   }
 
+  setAccountEnabled(id: number, enabled: boolean): Account {
+    const timestamp = now();
+    this.db.prepare(`
+      UPDATE accounts
+      SET enabled = ?, updated_at = ?
+      WHERE id = ?
+    `).run(enabled ? 1 : 0, timestamp, id);
+    return this.getAccount(id)!;
+  }
+
   deleteAccount(id: number) {
     this.db.prepare("DELETE FROM accounts WHERE id = ?").run(id);
   }
@@ -391,7 +403,7 @@ export class AppDatabase {
   findAvailableAccount(model: DoubaoModel): Account | undefined {
     const settings = this.getSettings();
     const requiredQuota = model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
-    return this.db.prepare(`
+    const found = this.db.prepare(`
       SELECT
         id,
         name,
@@ -405,17 +417,20 @@ export class AppDatabase {
         last_quota_reset_date AS lastQuotaResetDate,
         last_used_at AS lastUsedAt,
         created_at AS createdAt,
-        updated_at AS updatedAt
+        updated_at AS updatedAt,
+        enabled AS enabled
       FROM accounts
       WHERE login_status = 'logged_in'
         AND current_status IN ('idle', 'error')
         AND quota_remaining >= ?
+        AND enabled = 1
       ORDER BY
         CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END ASC,
         last_used_at ASC,
         id ASC
       LIMIT 1
     `).get(requiredQuota) as Account | undefined;
+    return found ? normalizeAccount(found) : undefined;
   }
 
   reserveAvailableAccount(model: DoubaoModel): Account | undefined {
@@ -773,6 +788,7 @@ export class AppDatabase {
     this.addColumnIfMissing("accounts", "device_memory", "INTEGER NOT NULL DEFAULT 8");
     this.addColumnIfMissing("accounts", "platform", "TEXT NOT NULL DEFAULT 'Win32'");
     this.addColumnIfMissing("accounts", "last_quota_reset_date", "TEXT");
+    this.addColumnIfMissing("accounts", "enabled", "INTEGER NOT NULL DEFAULT 1");
 
     this.db.prepare(`
       UPDATE accounts
@@ -902,6 +918,14 @@ function parseSettingValue(key: keyof AppSettings, value: string) {
 
 function isSettingsKey(key: string): key is keyof AppSettings {
   return key in DEFAULT_SETTINGS;
+}
+
+function normalizeAccount(row: unknown): Account {
+  const account = row as Account & { enabled: number | boolean };
+  return {
+    ...account,
+    enabled: Boolean(account.enabled)
+  };
 }
 
 function normalizeApiRequest(row: unknown): ApiRequest {

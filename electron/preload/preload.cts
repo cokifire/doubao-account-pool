@@ -6,6 +6,7 @@ const api = {
     list: () => ipcRenderer.invoke("accounts:list"),
     create: (remark?: string) => ipcRenderer.invoke("accounts:create", remark),
     update: (input: AccountUpdateInput) => ipcRenderer.invoke("accounts:update", input),
+    setEnabled: (id: number, enabled: boolean) => ipcRenderer.invoke("accounts:set-enabled", id, enabled),
     delete: (id: number) => ipcRenderer.invoke("accounts:delete", id),
     open: (id: number) => ipcRenderer.invoke("accounts:open", id),
     relogin: (id: number) => ipcRenderer.invoke("accounts:relogin", id),

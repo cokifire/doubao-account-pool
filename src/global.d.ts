@@ -15,6 +15,7 @@ declare global {
         list: () => Promise<Account[]>;
         create: (remark?: string) => Promise<Account>;
         update: (input: AccountUpdateInput) => Promise<Account>;
+        setEnabled: (id: number, enabled: boolean) => Promise<Account>;
         delete: (id: number) => Promise<boolean>;
         open: (id: number) => Promise<void>;
         relogin: (id: number) => Promise<boolean>;
