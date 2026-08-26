@@ -17,6 +17,17 @@ export function extractDoubaoConversationUrl(value: string | null | undefined) {
   return matched?.replace(/[)\]}>，。！？；;]+$/, "") || null;
 }
 
+const DOUBAO_LOCAL_DRAFT_CONVERSATION_URL_RE = /\/chat\/local_/i;
+
+/**
+ * 判断是否为豆包浏览器端本地草稿会话地址（/chat/local_...）。
+ * 该前缀地址只是客户端本地草稿，尚未在服务端创建正式会话；
+ * 提示词真正发送成功后，豆包会把 URL 切换为服务端正式会话地址。
+ */
+export function isLocalDraftDoubaoConversationUrl(url: string | null | undefined) {
+  return Boolean(url && DOUBAO_LOCAL_DRAFT_CONVERSATION_URL_RE.test(url));
+}
+
 export function promptSignature(prompt: string) {
   const normalized = normalizeComparableText(prompt);
   return normalized.slice(0, Math.min(42, Math.max(12, normalized.length)));

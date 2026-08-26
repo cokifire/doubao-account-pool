@@ -14,6 +14,7 @@ import {
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
   isGenerationReadyForShare,
+  isLocalDraftDoubaoConversationUrl,
   isQuotaNotChargedFailure,
   promptSignature,
 } from '../dist-electron/doubao-page-state.js'
@@ -105,6 +106,23 @@ test('accepts only chat pages as recoverable source conversations', () => {
     'https://www.doubao.com/chat/38437129678594562'
   )
   assert.equal(extractDoubaoConversationUrl('https://www.doubao.com/thread/xZR7KqTbeRvEAjlB8'), null)
+})
+
+test('distinguishes local draft URLs from official Doubao conversations', () => {
+  assert.equal(
+    isLocalDraftDoubaoConversationUrl('https://www.doubao.com/chat/local_3921336934625024'),
+    true
+  )
+  assert.equal(
+    isLocalDraftDoubaoConversationUrl('https://www.doubao.com/chat/local_2452181702532277?from=home'),
+    true
+  )
+  assert.equal(
+    isLocalDraftDoubaoConversationUrl('https://www.doubao.com/chat/38437129678594562'),
+    false
+  )
+  assert.equal(isLocalDraftDoubaoConversationUrl(null), false)
+  assert.equal(isLocalDraftDoubaoConversationUrl('https://www.doubao.com/chat'), false)
 })
 
 test('does not treat prompt rewrite pages as generated videos', () => {

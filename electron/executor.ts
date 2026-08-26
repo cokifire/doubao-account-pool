@@ -15,6 +15,7 @@ import {
   isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
+  isLocalDraftDoubaoConversationUrl,
   isGenerationReadyForShare,
   isQuotaNotChargedFailure,
   normalizeComparableText
@@ -333,15 +334,25 @@ export class DoubaoExecutor {
       });
       const generationBaseline = await inspectGenerationPage(win);
       await submitPromptAndWait(win, request.model, request.prompt);
-      submittedToDoubao = true;
       const submittedConversationUrl = await waitForSubmittedConversationUrl(win);
       if (submittedConversationUrl) {
+        submittedToDoubao = true;
         await this.updateProgress({
           requestId,
           status: "running",
           message: "已记录本次豆包会话地址，等待视频完成",
           doubaoThreadUrl: submittedConversationUrl
         });
+      } else if (!(await isSubmissionConfirmedOnPage(win))) {
+        // 提交后未等到正式会话地址，且页面也没有出现提交确认文案，
+        // 说明本次任务根本没有在豆包创建对话（提示词未真正发送成功）。
+        // 此时不设置 submittedToDoubao，任务快速失败并退还额度。
+        throw new DoubaoPageFailureError(
+          "提交豆包后未检测到正式会话地址，豆包未真正创建本次对话，可能提示词未发送成功",
+          true
+        );
+      } else {
+        submittedToDoubao = true;
       }
 
       await this.updateProgress({
@@ -1062,6 +1073,22 @@ async function waitForSubmissionStarted(
   }
 
   return { confirmed: false, sentEvidence: false, failureMessage: null };
+}
+
+/**
+ * 兜底判定：当提交后未等到正式会话地址时，检查当前页面是否已出现
+ * “本次使用 Seedance 2.0 Mini/Fast 生成 + 视频生成好后 + 本次生成将消耗每日免费额度”
+ * 的提交确认文案。若存在说明提示词确实发送成功了（只是会话地址未及时切换）。
+ */
+async function isSubmissionConfirmedOnPage(win: BrowserWindow) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
+      return /本次使用\\s+Seedance\\s*2\\.0\\s*(?:Mini|Fast)\\s+生成/.test(pageText)
+        && pageText.includes("视频生成好后")
+        && pageText.includes("本次生成将消耗每日免费额度");
+    })()
+  `);
 }
 
 interface GenerationPageState {
@@ -1980,14 +2007,20 @@ async function findOverflowMenuPoint(win: BrowserWindow) {
   `);
 }
 
-async function waitForSubmittedConversationUrl(win: BrowserWindow, timeoutMs = 2600) {
+async function waitForSubmittedConversationUrl(win: BrowserWindow, timeoutMs = 8000) {
   let conversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs
-    && (!conversationUrl || /\/chat\/local_/i.test(conversationUrl))) {
+    && (!conversationUrl || isLocalDraftDoubaoConversationUrl(conversationUrl))) {
     await wait(200);
     const currentUrl = extractDoubaoConversationUrl(win.webContents.getURL());
     if (currentUrl) conversationUrl = currentUrl;
+  }
+  // 提示词真正发送成功后，豆包会把 /chat/local_... 本地草稿地址切换为服务端正式会话地址。
+  // 若等待超时后仍是草稿地址，说明本次任务没有真正创建豆包会话，
+  // 此时不能把草稿地址当作正式会话返回，返回 null 交由上层判定失败。
+  if (!conversationUrl || isLocalDraftDoubaoConversationUrl(conversationUrl)) {
+    return null;
   }
   return conversationUrl;
 }
