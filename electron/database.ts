@@ -18,7 +18,25 @@ import type {
 } from "./types.js";
 import { generateFingerprint } from "./fingerprint.js";
 
-const now = () => new Date().toISOString();
+/** 本地时间 ISO 字符串（含时区偏移，如 2026-08-26T21:30:00.123+08:00），跟随系统时区。 */
+function toLocalIso(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  const ss = String(date.getSeconds()).padStart(2, "0");
+  const ms = String(date.getMilliseconds()).padStart(3, "0");
+  const offsetMin = -date.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const oh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const om = String(abs % 60).padStart(2, "0");
+  return `${y}-${m}-${d}T${hh}:${mm}:${ss}.${ms}${sign}${oh}:${om}`;
+}
+
+/** 数据库时间戳：跟随系统本地时间（而非 UTC）。 */
+const now = () => toLocalIso(new Date());
 
 /** 本地日期 YYYY-MM-DD（按运行时时区，而非 UTC）。 */
 function todayLocalDate(): string {
@@ -366,7 +384,7 @@ export class AppDatabase {
          WHERE last_quota_reset_date IS NULL
             OR last_quota_reset_date < ?`
       )
-      .run(resetDayStr, now.toISOString(), resetDayStr);
+      .run(resetDayStr, toLocalIso(now), resetDayStr);
     return result.changes;
   }
 
@@ -711,7 +729,7 @@ export class AppDatabase {
   }
 
   private pruneOperationLogs() {
-    const cutoff = new Date(Date.now() - OPERATION_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const cutoff = toLocalIso(new Date(Date.now() - OPERATION_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000));
     this.db.prepare("DELETE FROM operation_logs WHERE created_at < ?").run(cutoff);
   }
 

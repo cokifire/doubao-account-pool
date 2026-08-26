@@ -639,6 +639,14 @@ function splitReferenceImagePaths(raw?: string): string[] {
   return trimmed.split(",").map((p) => p.trim()).filter(Boolean);
 }
 
+/** 本地日期 YYYY-MM-DD（按运行时时区，而非 UTC）。 */
+function localDateStr(date = new Date()): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 async function prepareReferenceImage(body: GenerateRequestBody, requestId: string) {
   if (body.referenceImagePath?.trim()) return body.referenceImagePath.trim();
   const imageUrl = body.referenceImageUrl?.trim();
@@ -652,7 +660,7 @@ async function prepareReferenceImage(body: GenerateRequestBody, requestId: strin
   const contentType = response.headers.get("content-type") || "";
   const urlExt = path.extname(new URL(imageUrl).pathname);
   const ext = urlExt || extensionFromContentType(contentType) || ".png";
-  const uploadDir = path.join(app.getPath("userData"), "uploads", new Date().toISOString().slice(0, 10));
+  const uploadDir = path.join(app.getPath("userData"), "uploads", localDateStr());
   await fs.mkdir(uploadDir, { recursive: true });
   const imagePath = path.join(uploadDir, `${requestId}-reference${ext}`);
   await fs.writeFile(imagePath, Buffer.from(await response.arrayBuffer()));
@@ -667,7 +675,7 @@ async function saveUploadedFile(input: {
   bytes: Buffer;
 }) {
   const safeName = sanitizeFilename(input.filename || `${input.fieldName}${extensionFromContentType(input.contentType) || ".png"}`);
-  const uploadDir = path.join(app.getPath("userData"), "uploads", new Date().toISOString().slice(0, 10));
+  const uploadDir = path.join(app.getPath("userData"), "uploads", localDateStr());
   await fs.mkdir(uploadDir, { recursive: true });
   const filePath = path.join(uploadDir, `${input.requestId}-${input.fieldName}-${safeName}`);
   await fs.writeFile(filePath, input.bytes);
