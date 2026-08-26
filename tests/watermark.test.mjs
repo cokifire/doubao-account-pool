@@ -4,21 +4,27 @@ import test from 'node:test'
 import {
   extractVideoUrlFromPayload,
   getWatermarkRetryDelays,
-  hasDoubaoShareVideoResource,
   isMp4VideoUrl,
   isRetryableWatermarkError,
+  isValidDoubaoShareUrl,
   WATERMARK_RETRY_DELAYS_MS,
 } from '../dist-electron/watermark.js'
 
-test('requires a real video resource in a copied Doubao share page', () => {
-  const valid = `
-    你的视频生成好了。
-    {\\"creation_block\\":{\\"video\\":{\\"cover\\":\\"video_dsz_watermark_1_6.png\\",
-    \\"video_type\\":\\"mp4\\",\\"download_url\\":\\"https:\\u002F\\u002Fcdn.example.com\\u002Fvideo?mime_type=video_mp4\\"}}}
-  `
-  assert.equal(hasDoubaoShareVideoResource(valid), true)
-  assert.equal(hasDoubaoShareVideoResource('你的视频生成好了，但只有普通对话内容'), false)
-  assert.equal(hasDoubaoShareVideoResource('download_url mime_type=video_mp4'), false)
+test('accepts real Doubao share link shapes', () => {
+  assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/thread/xbFzZPi2eseSsvsO8'), true)
+  assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/share/abcd1234?x=1'), true)
+  assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/thread/xbFzZPi2eseSsvsO8/posts?fid=1'), true)
+})
+
+test('rejects chat URLs (login-required, not share links) and garbage', () => {
+  assert.equal(isValidDoubaoShareUrl(''), false)
+  assert.equal(isValidDoubaoShareUrl('https://example.com/page'), false)
+  assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/search?q=video'), false)
+  assert.equal(isValidDoubaoShareUrl('不是链接'), false)
+  assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/'), false)
+  assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/chat/1234abcd'), false)
+  assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/chat/local_0000000000000000000000'), false)
+  assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/chat/38438949252373250'), false)
 })
 
 test('extracts a nested MP4 result', () => {

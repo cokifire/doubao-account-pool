@@ -17,6 +17,7 @@ import {
   isDoubaoPromptRewritePage,
   isLocalDraftDoubaoConversationUrl,
   isGenerationReadyForShare,
+  isPromptMovedOutOfComposer,
   isQuotaNotChargedFailure,
   normalizeComparableText
 } from "./doubao-page-state.js";
@@ -78,6 +79,11 @@ const SHARE_PANEL_WAIT_MS = 3500;
 const CLIPBOARD_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
 const VIDEO_CARD_WAIT_MS = 15000;
+// 豆包分享链接是复制时刻的页面快照：视频刚生成完时分享，快照可能不包含视频卡，
+// 去水印接口将永远解析不到资源。复制后需打开分享页验证渲染结果，缺失则等待后
+// 重新分享（每次分享生成新的快照），直到分享页确认包含视频或尝试次数用尽。
+const SHARE_VERIFY_MAX_ATTEMPTS = 4;
+const SHARE_VERIFY_BACKOFF_MS = [0, 20000, 40000, 80000];
 const callbackQueues = new Map<string, Promise<void>>();
 
 export class DoubaoExecutor {
@@ -388,9 +394,19 @@ export class DoubaoExecutor {
         requestId,
         "复制分享地址",
         "success",
-        "已复制并确认豆包分享页包含视频资源",
+        "已复制并确认豆包分享链接",
         generationResult.shareUrl
       );
+
+      // 分享链接一旦复制成功，立即把 doubaoThreadUrl 更新为正式的 /thread/ 分享地址。
+      // 否则提交时记录的 /chat/<id> 会话地址会一直保留到成功路径，去水印失败时
+      // 请求结果里的 thread_url 就会是 /chat/ 而非 /thread/，导致链接不可用。
+      await this.updateProgress({
+        requestId,
+        status: "running",
+        message: "已确认豆包分享链接",
+        doubaoThreadUrl: generationResult.shareUrl
+      });
 
       if (!request.removeWatermark) {
         throw new Error("接口仅返回去水印视频，本次请求未启用去水印");
@@ -427,7 +443,9 @@ export class DoubaoExecutor {
       if (shouldRefundQuota) {
         this.database.refundQuota(account.id, request.model);
       }
-      await this.failRequest(request, errorMessage(error), shouldRefundQuota);
+      const diagnosticsDir = await captureExecutionDiagnostics(win, requestId);
+      const suffix = diagnosticsDir ? `；诊断截图已保存到 ${diagnosticsDir}` : "";
+      await this.failRequest(request, errorMessage(error) + suffix, shouldRefundQuota);
       this.database.updateAccount({
         id: account.id,
         currentStatus: keepWindowOpen ? "login_required" : "idle"
@@ -517,7 +535,7 @@ export class DoubaoExecutor {
     await this.updateProgress({
       requestId,
       status: "running",
-      message: "分享链接已确认包含视频资源，正在请求去水印服务"
+      message: "分享链接已确认，正在请求去水印服务"
     });
 
     try {
@@ -623,10 +641,11 @@ async function uploadReferenceImage(win: BrowserWindow, imagePaths: string[]) {
 
   // 豆包上传控件支持批量选择，一次性批量注入所有参考图。
   // CDP 的 DOM.setFileInputFiles 可直接设置多文件，不受 input 的 multiple 属性限制。
-  const settleWaitMs = 2500 + Math.min(resolvedPaths.length, 10) * 200;
+  const settleWaitMs = 3000 + Math.min(resolvedPaths.length, 10) * 1000;
 
   if (await setFileInputs(win, resolvedPaths)) {
     await wait(settleWaitMs);
+    await waitForImageUploads(win, resolvedPaths.length, 25000);
     return;
   }
 
@@ -635,10 +654,60 @@ async function uploadReferenceImage(win: BrowserWindow, imagePaths: string[]) {
 
   if (await setFileInputs(win, resolvedPaths)) {
     await wait(settleWaitMs);
+    await waitForImageUploads(win, resolvedPaths.length, 25000);
     return;
   }
 
   throw new Error("没有找到豆包页面的图片上传控件");
+}
+
+/**
+ * 轮询等待图片上传完成。豆包在图片预览区显示缩略图，
+ * 上传中的图片会带有 loading / spinner 等动画元素。
+ * 这里通过检测页面上半部分是否还有可见的转圈/动画元素来判断上传是否结束。
+ */
+async function waitForImageUploads(win: BrowserWindow, expectedCount: number, timeoutMs: number) {
+  const start = Date.now();
+  const intervalMs = 1500;
+  while (Date.now() - start < timeoutMs) {
+    const stillUploading = await win.webContents.executeJavaScript(`
+      (() => {
+        // 1. 检查上半屏是否有小尺寸动画元素（loading spinner）
+        const spinners = Array.from(document.querySelectorAll('*')).filter(el => {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) return false;
+          if (rect.top > window.innerHeight * 0.6) return false; // 只看上半屏
+          if (rect.width > 80 || rect.height > 80) return false; // 只取小元素
+          const style = window.getComputedStyle(el);
+          const animating = style.animationName !== 'none' && parseFloat(style.animationDuration) > 0;
+          const spinnerClass = /loading|spin|spinner|uploading|progress/i.test(el.className + ' ' + (el.getAttribute('class') || ''));
+          return animating || spinnerClass;
+        });
+
+        // 2. 检查页面文本中是否还有"上传中"
+        const hasUploadingText = /上传中|正在上传/i.test(document.body.innerText);
+
+        // 3. 统计上半屏可见的图片缩略图数量（宽高大於 40px）
+        const thumbs = Array.from(document.querySelectorAll('img')).filter(img => {
+          const rect = img.getBoundingClientRect();
+          return rect.width > 40 && rect.height > 40 && rect.top < window.innerHeight * 0.6;
+        });
+
+        return {
+          spinnerCount: spinners.length,
+          hasUploadingText,
+          thumbCount: thumbs.length,
+          stillUploading: spinners.length > 0 || hasUploadingText || thumbs.length < ${expectedCount}
+        };
+      })()
+    `).catch(() => ({ stillUploading: true }));
+
+    if (!stillUploading.stillUploading) {
+      return;
+    }
+
+    await wait(intervalMs);
+  }
 }
 
 async function setFileInputs(win: BrowserWindow, filePaths: string[]) {
@@ -716,11 +785,18 @@ async function fillPrompt(win: BrowserWindow, prompt: string) {
     tried.push(attempt.label);
     await attempt.run();
     const diagnostics = await inspectComposer(win, prompt);
-    if (diagnostics.promptPresent) return;
+    // 只凭 DOM 里能看到提示词还不够：若页面存在发送按钮但全部处于不可用状态，
+    // 说明编辑器的内部状态没有注册这段文本（DOM 与编辑器模型不一致），继续尝试下一种写入方式。
+    if (diagnostics.promptPresent && isComposerSendable(diagnostics)) return;
   }
 
   const diagnostics = await inspectComposer(win, prompt);
   throw new Error(`豆包输入框没有真正接收本次提示词（已尝试 ${tried.join("、")}；${formatComposerDiagnostics(diagnostics)}）`);
+}
+
+function isComposerSendable(input: Awaited<ReturnType<typeof inspectComposer>>) {
+  // 页面存在发送按钮时要求至少一个可用；若页面本来就没有发送按钮，则以输入框内容为准。
+  return input.sendCandidates === 0 || input.enabledSendCandidates > 0;
 }
 
 async function findComposerTarget(win: BrowserWindow) {
@@ -822,6 +898,15 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
       }
     },
     {
+      label: "右下角发送图标",
+      run: async () => {
+        const sendPoint = await findComposerSendButtonPoint(win);
+        if (!sendPoint) return false;
+        await sendMouseClick(win, sendPoint.x, sendPoint.y);
+        return true;
+      }
+    },
+    {
       label: "Command+Enter",
       run: async () => {
         await sendKeyboard(win, "Enter", ["meta"]);
@@ -836,15 +921,6 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
       }
     },
     {
-      label: "右下角发送图标",
-      run: async () => {
-        const sendPoint = await findComposerSendButtonPoint(win);
-        if (!sendPoint) return false;
-        await sendMouseClick(win, sendPoint.x, sendPoint.y);
-        return true;
-      }
-    },
-    {
       label: "发送文字按钮",
       run: () => clickByKeywords(win, ["发送", "提交"])
     }
@@ -852,6 +928,14 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
 
   const tried: string[] = [];
   for (const attempt of attempts) {
+    // 上一轮发送尝试可能把输入框里的内容清掉了（DOM 文本被编辑器丢弃，但并未真正发出）。
+    // 此时先判断提示词是否已移入聊天区：若已移入说明消息确实发出，直接成功；
+    // 否则重新填写提示词后再尝试下一种发送方式，避免发送空内容。
+    const composerBefore = await inspectComposer(win, prompt);
+    if (!composerBefore.promptPresent && tried.length > 0) {
+      if (await isPromptMovedToChat(win, prompt)) return;
+      await fillPrompt(win, prompt);
+    }
     const didRun = await attempt.run();
     if (!didRun) continue;
     tried.push(attempt.label);
@@ -870,6 +954,36 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
   throw new Error(
     `没有看到豆包提交确认文案：本次使用 ${modelLabel} 生成；已尝试 ${tried.join("、") || "无可用发送动作"}；${formatComposerDiagnostics(diagnostics)}`
   );
+}
+
+/**
+ * 判断提示词是否已经从输入框移入聊天区（说明消息真正发出并被回显）。
+ */
+async function isPromptMovedToChat(win: BrowserWindow, prompt: string) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const isPromptMovedOutOfComposer = ${isPromptMovedOutOfComposer.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const editableSelector = 'textarea, [contenteditable="true"], [role="textbox"], input[type="text"]';
+      const editables = Array.from(document.querySelectorAll(editableSelector))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+        .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const editor = editables[0];
+      const editorText = editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement
+        ? editor.value
+        : (editor?.innerText || editor?.textContent || "");
+      const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
+      return isPromptMovedOutOfComposer({
+        pageText,
+        composerText: editorText,
+        prompt: ${JSON.stringify(prompt)}
+      });
+    })()
+  `);
 }
 
 async function sendKeyboard(
@@ -1030,6 +1144,7 @@ async function waitForSubmissionStarted(
         const extractDoubaoFailureMessage = ${extractDoubaoFailureMessage.toString()};
         const hasNewPromptOccurrence = ${hasNewPromptOccurrence.toString()};
         const hasNewTextOccurrence = ${hasNewTextOccurrence.toString()};
+        const isPromptMovedOutOfComposer = ${isPromptMovedOutOfComposer.toString()};
         const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
         const expected = "本次使用 " + modelLabel + " 生成";
         const failureMessage = extractDoubaoFailureMessage(pageText);
@@ -1055,9 +1170,12 @@ async function waitForSubmissionStarted(
         const promptStillInComposer = Boolean(promptSignature && normalizedEditorText.includes(promptSignature));
         const composerCleared = !editor || normalizedEditorText.length === 0 || !promptStillInComposer;
         const pageChanged = pageText !== baselineText;
+        // 强证据：输入框清空后提示词仍出现在页面文本中，说明消息已回显到聊天区。
+        // 若输入框清空后页面里也找不到提示词，说明内容被编辑器丢弃，并未真正发送。
+        const promptMovedToChat = isPromptMovedOutOfComposer({ pageText, composerText: editorText, prompt });
         const sentEvidence = !newFailureMessage
           && pageChanged
-          && (hasNewPromptOccurrence(pageText, baselineText, prompt) || composerCleared);
+          && (hasNewPromptOccurrence(pageText, baselineText, prompt) || promptMovedToChat);
         return {
           confirmed: hasNewTextOccurrence(pageText, baselineText, expected)
             && pageText.includes("视频生成好后")
@@ -1098,6 +1216,29 @@ async function isSubmissionConfirmedOnPage(win: BrowserWindow) {
         && pageText.includes("本次生成将消耗每日免费额度");
     })()
   `);
+}
+
+/**
+ * 任务失败时保存诊断现场（窗口截图 + 页面文本），便于排查“提示词未发送成功”等问题。
+ */
+async function captureExecutionDiagnostics(win: BrowserWindow | null | undefined, requestId: string) {
+  if (!win || win.isDestroyed()) return null;
+  try {
+    const dir = path.join(app.getPath("userData"), "debug", requestId);
+    await fs.mkdir(dir, { recursive: true });
+    const pageText = await runPageScript<string>(win, `
+      (() => {
+        const text = document.body?.innerText || "";
+        return text.replace(/\\s+/g, " ").trim().slice(-3000);
+      })()
+    `).catch(() => "");
+    await fs.writeFile(path.join(dir, "page-text.txt"), pageText, "utf8");
+    const image = await win.webContents.capturePage();
+    await fs.writeFile(path.join(dir, "screenshot.png"), image.toPNG());
+    return dir;
+  } catch {
+    return null;
+  }
 }
 
 interface GenerationPageState {
@@ -1183,10 +1324,17 @@ async function waitForGenerationResult(
       }
       directVideoUrl ||= pageState.directVideoUrl;
 
-      const copied = await tryCopyShareLink(win);
+      // Doubao 的分享链接是复制时刻的页面快照。视频刚生成完时分享，
+      // 快照可能还没有视频卡片，去水印接口将永远找不到资源。复制后
+      // 打开分享页验证渲染结果，缺失则等待后重新分享。
+      const conversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
+      const copied = await copyShareLinkUntilVideoVerified(win, conversationUrl, onProgress);
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
         return { shareUrl: copied.shareUrl, directVideoUrl };
+      }
+      if (copied.exhausted) {
+        return { shareUrl: null, directVideoUrl, shareFailureReason: shareFailureReason };
       }
 
       if (Date.now() - generatedAt > 120000) {
@@ -1403,7 +1551,7 @@ async function findGeneratedConversationAndCopyShare(
     generatedMatchCount += 1;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const copied = await tryCopyShareLink(win);
+      const copied = await copyShareLinkUntilVideoVerified(win, candidate, () => undefined);
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
         return {
@@ -1414,6 +1562,7 @@ async function findGeneratedConversationAndCopyShare(
           shareFailureReason: null
         };
       }
+      if (copied.exhausted) break;
       await wait(1000);
     }
   }
@@ -1436,6 +1585,90 @@ async function waitForGeneratedVideoCard(win: BrowserWindow, timeoutMs: number) 
     state = await inspectGenerationPage(win);
   }
   return state;
+}
+
+/**
+ * 打开分享链接并等待渲染，确认分享页里真的包含"生成完成"文案与视频卡片。
+ * 豆包分享链接是复制时刻的快照：视频未在服务端最终化时复制的链接，分享页
+ * 永远没有视频，去水印接口也就永远解析不到资源。成功后窗口停留在分享页。
+ */
+async function verifySharePageHasRenderedVideo(win: BrowserWindow, shareUrl: string) {
+  try {
+    await loadUrl(win, shareUrl, 10000);
+    await dismissDoubaoDesktopDownloadPrompt(win);
+    const startedAt = Date.now();
+    let state = await inspectGenerationPage(win);
+    while (Date.now() - startedAt < 20000) {
+      const ready = isGenerationReadyForShare({
+        completionTextPresent: hasNewGenerationCompletion(state.pageText, ""),
+        hasNewVideoSource: state.videoUrls.length > 0,
+        newVideoCount: state.videoUrls.length,
+        newPlayableVideoCount: state.playableVideoCount,
+        newVideoCardCount: state.videoCardCount,
+        completionTextSeenAt: Date.now(),
+        now: Date.now()
+      });
+      if (ready) return true;
+      if (state.failed) return false;
+      await wait(1000);
+      state = await inspectGenerationPage(win);
+    }
+    return false;
+  } catch (error) {
+    console.warn("验证豆包分享页未包含视频", error);
+    return false;
+  }
+}
+
+interface ShareVerifiedResult {
+  shareUrl: string | null;
+  reason: string | null;
+  exhausted: boolean;
+}
+
+/**
+ * 复制分享链接并在分享页验证视频卡片，最多尝试 SHARE_VERIFY_MAX_ATTEMPTS 次。
+ * 每次分享都会生成新的快照，因此未通过验证时等待退避后重新分享，给豆包留出
+ * 视频在服务端最终化的时间。复制失败的瞬态问题返回 exhausted=false，由调用方
+ * 的外层循环继续重试；验证耗尽返回 exhausted=true，避免外层循环无限重复。
+ */
+async function copyShareLinkUntilVideoVerified(
+  win: BrowserWindow,
+  conversationUrl: string | null,
+  onProgress: (message: string) => Promise<void> | void
+): Promise<ShareVerifiedResult> {
+  let lastReason: string | null = null;
+  for (let attempt = 1; attempt <= SHARE_VERIFY_MAX_ATTEMPTS; attempt += 1) {
+    // 分享验证会导航到分享页；失败后必须回到会话页才能重新打开分享面板。
+    const currentConversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
+    if (conversationUrl && currentConversationUrl !== conversationUrl) {
+      try {
+        await loadUrl(win, conversationUrl, 8000);
+        await dismissDoubaoDesktopDownloadPrompt(win);
+        await waitForGeneratedVideoCard(win, VIDEO_CARD_WAIT_MS);
+      } catch (error) {
+        console.warn("返回豆包会话页失败", error);
+      }
+    }
+
+    const copied = await tryCopyShareLink(win);
+    lastReason = copied.reason;
+    if (!copied.shareUrl) {
+      // 分享面板等瞬态失败由调用方的外层循环继续重试。
+      return { shareUrl: null, reason: lastReason, exhausted: false };
+    }
+
+    if (await verifySharePageHasRenderedVideo(win, copied.shareUrl)) {
+      return { shareUrl: copied.shareUrl, reason: null, exhausted: false };
+    }
+
+    lastReason = `分享页快照未包含视频（第 ${attempt}/${SHARE_VERIFY_MAX_ATTEMPTS} 次）`;
+    if (attempt < SHARE_VERIFY_MAX_ATTEMPTS) {
+      await onProgress(`${lastReason}，${Math.round(SHARE_VERIFY_BACKOFF_MS[attempt] / 1000)} 秒后重新分享`);
+      await wait(SHARE_VERIFY_BACKOFF_MS[attempt]);
+    }
+  }
+  return { shareUrl: null, reason: lastReason, exhausted: true };
 }
 
 async function tryCopyShareLink(win: BrowserWindow) {

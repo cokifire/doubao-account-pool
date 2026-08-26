@@ -2,7 +2,7 @@ export function normalizeComparableText(value: string) {
   return value.replace(/[^\p{L}\p{N}]+/gu, "").trim();
 }
 
-const DOUBAO_SHARE_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/(?:thread|chat|share)\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
+const DOUBAO_SHARE_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/(?:thread|share)\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
 const DOUBAO_CONVERSATION_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/chat\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
 
 export function extractDoubaoShareUrl(value: string | null | undefined) {
@@ -160,6 +160,27 @@ export function hasNewTextOccurrence(currentText: string, baselineText: string, 
     }
   };
   return count(currentText) > count(baselineText);
+}
+
+/**
+ * 判定“提示词已从输入框移出并进入聊天区”：
+ * 输入框（composer）里不再包含提示词签名，但整页文本里仍包含该签名，
+ * 说明提示词被真正发送并回显在聊天消息中；若输入框清空后页面里也找不到提示词，
+ * 说明内容被丢弃（例如编辑器内部状态没有注册 DOM 文本），属于发送失败。
+ */
+export function isPromptMovedOutOfComposer(input: {
+  pageText: string;
+  composerText: string;
+  prompt: string;
+}) {
+  const normalize = (value: string) => value.replace(/[^\p{L}\p{N}]+/gu, "").trim();
+  const normalizedPrompt = normalize(input.prompt);
+  const signature = normalizedPrompt.slice(0, Math.min(42, Math.max(12, normalizedPrompt.length)));
+  if (!signature) return false;
+  const normalizedComposerText = normalize(input.composerText);
+  const composerCleared = normalizedComposerText.length === 0 || !normalizedComposerText.includes(signature);
+  const promptStillInPage = normalize(input.pageText).includes(signature);
+  return composerCleared && promptStillInPage;
 }
 
 export function hasNewPromptOccurrence(currentText: string, baselineText: string, prompt: string) {

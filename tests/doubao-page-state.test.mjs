@@ -15,6 +15,7 @@ import {
   isDoubaoPromptRewritePage,
   isGenerationReadyForShare,
   isLocalDraftDoubaoConversationUrl,
+  isPromptMovedOutOfComposer,
   isQuotaNotChargedFailure,
   promptSignature,
 } from '../dist-electron/doubao-page-state.js'
@@ -85,10 +86,7 @@ test('extracts current Doubao share URL formats', () => {
     extractDoubaoShareUrl('复制链接：https://www.doubao.com/thread/abc_123?from=share。'),
     'https://www.doubao.com/thread/abc_123?from=share'
   )
-  assert.equal(
-    extractDoubaoShareUrl('https://doubao.com/chat/chat_123#video'),
-    'https://doubao.com/chat/chat_123#video'
-  )
+  assert.equal(extractDoubaoShareUrl('https://doubao.com/chat/chat_123#video'), null)
   assert.equal(
     extractDoubaoShareUrl('https://www.doubao.com/share/share-123'),
     'https://www.doubao.com/share/share-123'
@@ -125,6 +123,46 @@ test('distinguishes local draft URLs from official Doubao conversations', () => 
   assert.equal(isLocalDraftDoubaoConversationUrl('https://www.doubao.com/chat'), false)
 })
 
+test('detects when the prompt moved from composer into the chat', () => {
+  const prompt = '生成视频：一只异兽在月下的森林中一闪而过。'
+  // 输入框已清空，提示词回显在聊天区 → 真正发送
+  assert.equal(
+    isPromptMovedOutOfComposer({
+      pageText: '本次使用 Seedance 2.0 Mini 生成 生成视频：一只异兽在月下的森林中一闪而过。 视频生成好后',
+      composerText: '',
+      prompt,
+    }),
+    true
+  )
+  // 输入框被清空但页面里也找不到提示词 → 内容被丢弃，并未发送
+  assert.equal(
+    isPromptMovedOutOfComposer({
+      pageText: '本次使用 Seedance 2.0 Mini 生成 视频生成好后',
+      composerText: '',
+      prompt,
+    }),
+    false
+  )
+  // 输入框里仍保留提示词（尚未清空）→ 不算已移入聊天区
+  assert.equal(
+    isPromptMovedOutOfComposer({
+      pageText: '生成视频：一只异兽在月下的森林中一闪而过。',
+      composerText: '生成视频：一只异兽在月下的森林中一闪而过。',
+      prompt,
+    }),
+    false
+  )
+  // 输入框被换成其它内容，但页面仍含提示词 → 已移出
+  assert.equal(
+    isPromptMovedOutOfComposer({
+      pageText: '生成视频：一只异兽在月下的森林中一闪而过。',
+      composerText: '正在重新输入...',
+      prompt,
+    }),
+    true
+  )
+})
+
 test('does not treat prompt rewrite pages as generated videos', () => {
   assert.equal(
     isDoubaoPromptRewritePage('完整 12 秒视频生成指令（可直接用于视频生成工具）'),
@@ -158,6 +196,42 @@ test('only treats a newly added completion message as the current result', () =>
 
   assert.equal(hasNewGenerationCompletion(oldMessages, oldMessages), false)
   assert.equal(hasNewGenerationCompletion(currentMessages, oldMessages), true)
+})
+
+test('share-page readiness rejects a snapshot copied before video finalization', () => {
+  // 取自真实分享页 innerText：分享链接复制太早时，快照里只有提交文案没有视频卡。
+  const snapshotWithoutVideo = [
+    '生成10秒视频',
+    '2026 年 8 月 26 日•AI 生成可能有误 注意核实',
+    '生成视频：没有提示词，发挥你的想象力，10s',
+    '我将为您把这四张图片制作成一个 10 秒的梦幻故事视频。',
+    '视频生成已提交',
+    '本次使用 Seedance 2.0 Mini 生成，预计等待 20 分钟。视频生成好后，我会主动发送给你。本次生成将消耗每日免费额度。',
+  ].join('\n')
+  const snapshotWithVideo = [
+    snapshotWithoutVideo,
+    '生成视频：没有提示词，发挥你的想象力，10s',
+    '你的视频生成好了。',
+    '打开豆包',
+  ].join('\n')
+
+  // 提交文案里的"视频生成好后"不应被误判为完成。
+  assert.equal(hasNewGenerationCompletion(snapshotWithoutVideo, ''), false)
+  assert.equal(hasNewGenerationCompletion(snapshotWithVideo, ''), true)
+
+  const readiness = (completionTextPresent, newVideoCardCount) =>
+    isGenerationReadyForShare({
+      completionTextPresent,
+      hasNewVideoSource: false,
+      newVideoCount: 0,
+      newPlayableVideoCount: 0,
+      newVideoCardCount,
+      completionTextSeenAt: Date.now(),
+      now: Date.now(),
+    })
+  assert.equal(readiness(false, 1), false)
+  assert.equal(readiness(true, 0), false)
+  assert.equal(readiness(true, 1), true)
 })
 
 test('waits for a video element before treating the result as share-ready', () => {

@@ -42,21 +42,19 @@ export function getWatermarkRetryDelays(
   return WATERMARK_RETRY_DELAYS_MS.slice(0, attemptCount);
 }
 
-export function hasDoubaoShareVideoResource(html: string) {
-  if (!html.trim()) return false;
+// 只有 /thread/（以及 /share/）才是豆包公开分享链接；
+// /chat/<id> 是需登录的会话页面地址，不是分享链接，不能用于去水印解析。
+const DOUBAO_SHARE_URL_RE = /^https?:\/\/(?:www\.)?doubao\.com\/(?:thread|share)\/[A-Za-z0-9._~-]+/i;
 
-  const normalized = html
-    .replace(/&quot;|&#34;|&#x22;/gi, '"')
-    .replace(/&amp;/gi, "&")
-    .replace(/\\u002f/gi, "/");
-  const hasCompletion = /你的视频(?:已经|已)?生成好[了啦]/.test(normalized);
-  const hasVideoBlock = /creation_block|video_dsz(?:2)?_watermark|video_pre_watermark/i.test(normalized);
-  const hasMp4 = /download_url/i.test(normalized)
-    && /mime_type(?:\\+"|"|[^A-Za-z0-9]){0,12}video_mp4|video_type(?:\\+"|"|[^A-Za-z0-9]){0,12}mp4/i.test(normalized);
-  return hasCompletion && hasVideoBlock && hasMp4;
+export function isValidDoubaoShareUrl(url: string) {
+  return DOUBAO_SHARE_URL_RE.test(url);
 }
 
 export async function verifyDoubaoShareVideoResource(shareUrl: string) {
+  if (!isValidDoubaoShareUrl(shareUrl)) {
+    throw new Error(`复制出的地址不是豆包分享链接：${shareUrl}`);
+  }
+
   let response: Response;
   try {
     response = await fetch(shareUrl, {
@@ -74,8 +72,11 @@ export async function verifyDoubaoShareVideoResource(shareUrl: string) {
   }
 
   const html = await response.text();
-  if (!hasDoubaoShareVideoResource(html)) {
-    throw new Error("复制出的豆包分享页没有包含当前视频资源");
+  // 豆包 thread 分享页是客户端渲染（SPA），视频数据不会出现在初始 HTML 里，
+  // 因此这里只做“页面确实能打开”的轻量检查；分享链接是否真的包含视频，
+  // 由后续去水印接口解析该 thread 链接时的结果来最终确认。
+  if (html.trim().length < 2000) {
+    throw new Error("复制出的豆包分享页没有正常加载内容");
   }
 }
 
