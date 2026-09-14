@@ -34,10 +34,14 @@ button {
 }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .topbar {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -93,6 +97,7 @@ button {
 }
 
 .tabs {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -119,6 +124,8 @@ button {
 }
 
 .panel {
+  flex: 1 1 auto;
+  min-height: 0;
   width: calc(100% - 36px);
   max-width: 1440px;
   margin: 18px auto;
@@ -126,6 +133,19 @@ button {
   border-radius: 8px;
   background: #ffffff;
   padding: 16px;
+}
+
+/* 账号池：概览与工具栏固定，仅账号表格滚动 */
+.accounts-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.accounts-panel > .section-title,
+.accounts-panel > .account-overview,
+.accounts-panel > .account-toolbar {
+  flex: 0 0 auto;
 }
 
 .section-title {
@@ -215,6 +235,14 @@ th {
   color: #687385;
   font-size: 12px;
   font-weight: 650;
+}
+
+/* 表格独立滚动时，表头跟随固定在顶部 */
+.accounts-table thead th,
+.logs-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
 td {
@@ -392,6 +420,7 @@ textarea:focus {
   max-width: 1440px;
   margin: 18px auto;
   align-items: start;
+  overflow: auto;
 }
 
 .settings-grid .panel {
@@ -567,7 +596,9 @@ pre {
 }
 
 .accounts-table-wrap {
-  overflow: visible;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
 }
 
 .accounts-table {
@@ -579,7 +610,7 @@ pre {
 }
 
 .accounts-table .account-col-status {
-  width: 15%;
+  width: 11%;
 }
 
 .accounts-table .account-col-quota {
@@ -591,7 +622,7 @@ pre {
 }
 
 .accounts-table .account-col-actions {
-  width: 19%;
+  width: 23%;
 }
 
 .accounts-table tbody tr {
@@ -835,6 +866,12 @@ pre {
   color: var(--warning);
 }
 
+/* 底部行：菜单向上弹出，避免被账号表格滚动容器裁切 */
+.account-menu-popover.open-up {
+  top: auto;
+  bottom: calc(100% + 6px);
+}
+
 .menu-separator {
   display: block;
   height: 1px;
@@ -880,7 +917,9 @@ pre {
 }
 
 .logs-table-wrap {
-  overflow-x: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
 }
 
 .logs-table {

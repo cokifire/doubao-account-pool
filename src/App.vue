@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import type {
   Account,
+  AccountAppType,
   AccountRuntimeStatus,
   ApiRequest,
   ApiRequestStatus,
@@ -27,6 +28,7 @@ const apiStatus = ref<ApiServerStatus>({
   message: "未启动"
 });
 const loading = ref(true);
+const backendMissing = ref(false);
 const activeTab = ref<TabKey>("accounts");
 const editingAccount = ref<Account | null>(null);
 const selectedRequest = ref<ApiRequest | null>(null);
@@ -34,6 +36,7 @@ const accountSearch = ref("");
 const accountStatusFilter = ref<"all" | "available" | "exhausted" | "login_required">("all");
 const openAccountMenuId = ref<number | null>(null);
 const batchMenuOpen = ref(false);
+const addAccountMenuOpen = ref(false);
 const apiAddressCopied = ref(false);
 const logSearch = ref("");
 const logStatusFilter = ref<"all" | ApiRequestStatus>("all");
@@ -55,6 +58,7 @@ const settingsForm = reactive<AppSettings>({
   showExecutorWindow: false,
   autoCloseExecutorWindow: true,
   doubaoChatUrl: "https://www.doubao.com/chat",
+  dolaChatUrl: "https://dola.com/chat",
   defaultModel: "seedance_2_0_mini",
   dailyQuotaLimit: 10,
   miniCost: 2,
@@ -93,6 +97,12 @@ const requestLabels: Record<ApiRequestStatus, string> = {
 const modelLabels: Record<DoubaoModel, string> = {
   seedance_2_0_mini: "Seedance 2.0 Mini",
   seedance_2_0_fast: "Seedance 2.0 Fast"
+};
+
+/** 站点展示名：豆包 = 国内版，Dola = 海外版（原 Cici）。 */
+const appTypeLabels: Record<AccountAppType, string> = {
+  doubao: "豆包",
+  dola: "Dola"
 };
 
 const modalRemainingQuota = computed(() =>
@@ -245,8 +255,9 @@ async function autoCheckAccountStatuses() {
   }
 }
 
-async function addAccountAndOpen() {
-  const account = await window.doubaoManager.accounts.create();
+async function addAccountAndOpen(appType: AccountAppType) {
+  addAccountMenuOpen.value = false;
+  const account = await window.doubaoManager.accounts.create({ appType });
   await window.doubaoManager.accounts.open(account.id);
   await refresh();
 }
@@ -272,7 +283,7 @@ async function detectAll() {
 }
 
 async function relogin(account: Account) {
-  if (!window.confirm(`清空 ${account.partition} 的登录状态并重新打开豆包？`)) return;
+  if (!window.confirm(`清空 ${account.partition} 的登录状态并重新打开${appTypeLabel(account)}？`)) return;
   await window.doubaoManager.accounts.relogin(account.id);
   await refresh();
 }
@@ -416,7 +427,7 @@ function sourceLabel(value: string) {
 }
 
 function requestAccountLabel(item: ApiRequest) {
-  const suffix = item.accountPartition?.match(/doubao_account_(\d+)$/)?.[1];
+  const suffix = item.accountPartition?.match(/(?:doubao|dola)_account_(\d+)$/)?.[1];
   if (suffix) return `账号 ${suffix}`;
   return item.accountName || item.accountPartition || "等待分配";
 }
@@ -445,8 +456,12 @@ async function copyOperationUrl(value: string) {
   await navigator.clipboard.writeText(value);
 }
 
+function appTypeLabel(account: Account) {
+  return appTypeLabels[account.appType] || appTypeLabels.doubao;
+}
+
 function accountCode(account: Account) {
-  const suffix = account.partition.match(/doubao_account_(\d+)$/)?.[1] || String(account.id).padStart(3, "0");
+  const suffix = account.partition.match(/(?:doubao|dola)_account_(\d+)$/)?.[1] || String(account.id).padStart(3, "0");
   return `账号 ${suffix}`;
 }
 
@@ -494,16 +509,25 @@ function remainingGenerations(account: Account, model: DoubaoModel) {
 function toggleAccountMenu(accountId: number) {
   openAccountMenuId.value = openAccountMenuId.value === accountId ? null : accountId;
   batchMenuOpen.value = false;
+  addAccountMenuOpen.value = false;
 }
 
 function toggleBatchMenu() {
   batchMenuOpen.value = !batchMenuOpen.value;
+  openAccountMenuId.value = null;
+  addAccountMenuOpen.value = false;
+}
+
+function toggleAddAccountMenu() {
+  addAccountMenuOpen.value = !addAccountMenuOpen.value;
+  batchMenuOpen.value = false;
   openAccountMenuId.value = null;
 }
 
 function closeMenus() {
   openAccountMenuId.value = null;
   batchMenuOpen.value = false;
+  addAccountMenuOpen.value = false;
 }
 
 function apiDisplayAddress() {
@@ -521,6 +545,13 @@ async function copyApiAddress() {
 
 onMounted(async () => {
   window.addEventListener("click", closeMenus);
+
+  if (!window.doubaoManager) {
+    loading.value = false;
+    backendMissing.value = true;
+    return;
+  }
+
   removeDataChangedListener = window.doubaoManager.events.onDataChanged(() => {
     void refresh();
   });
@@ -575,7 +606,12 @@ onBeforeUnmount(() => {
 
     <section v-if="loading" class="empty">加载中...</section>
 
-    <section v-else-if="activeTab === 'accounts'" class="panel">
+    <section v-else-if="backendMissing" class="empty">
+      <p>未检测到后端接口（doubaoManager）。</p>
+      <p>请通过 Electron 应用启动本界面，不要直接在浏览器中打开 Vite 开发地址。</p>
+    </section>
+
+    <section v-else-if="activeTab === 'accounts'" class="panel accounts-panel">
       <div class="section-title">
         <div>
           <h2>账号池</h2>
@@ -650,7 +686,13 @@ onBeforeUnmount(() => {
               <button class="warning-text" type="button" @click="batchMenuOpen = false; resetAllQuotas()">重置全部今日额度</button>
             </div>
           </div>
-          <button class="button primary" @click="addAccountAndOpen">添加账号</button>
+          <div class="action-menu add-account-menu">
+            <button class="button primary" type="button" @click.stop="toggleAddAccountMenu">添加账号</button>
+            <div v-if="addAccountMenuOpen" class="action-menu-popover" @click.stop>
+              <button type="button" @click="addAccountAndOpen('doubao')">豆包</button>
+              <button type="button" @click="addAccountAndOpen('dola')">Dola（海外版）</button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -673,10 +715,11 @@ onBeforeUnmount(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="account in filteredAccounts" :key="account.id" :class="{ 'quota-exhausted-row': isQuotaExhausted(account), 'account-disabled-row': !account.enabled }">
+            <tr v-for="(account, index) in filteredAccounts" :key="account.id" :class="{ 'quota-exhausted-row': isQuotaExhausted(account), 'account-disabled-row': !account.enabled }">
               <td class="account-info-cell">
                 <div class="account-name-line">
                   <strong>{{ accountCode(account) }}</strong>
+                  <span class="account-app-badge" :class="account.appType">{{ appTypeLabel(account) }}</span>
                   <button class="partition-info" type="button" :title="account.partition" aria-label="查看账号隔离分区">i</button>
                   <span v-if="!account.enabled" class="account-disabled-badge">已禁用</span>
                 </div>
@@ -708,11 +751,11 @@ onBeforeUnmount(() => {
                   <button class="button compact-button" :class="{ primary: !account.enabled }" @click="toggleAccountEnabled(account)" :title="account.enabled ? '禁用该账号（禁用后不再参与自动分配）' : '启用该账号（可参与自动分配）'">
                     {{ account.enabled ? "禁用" : "启用" }}
                   </button>
-                  <button class="button primary compact-button" @click="openAccount(account)">打开豆包</button>
+                  <button class="button primary compact-button" @click="openAccount(account)">打开{{ appTypeLabel(account) }}</button>
                   <button class="button compact-button" @click="detectAccount(account)">检测</button>
                   <div class="action-menu">
                     <button class="more-button" type="button" aria-label="更多账号操作" @click.stop="toggleAccountMenu(account.id)">···</button>
-                    <div v-if="openAccountMenuId === account.id" class="action-menu-popover account-menu-popover" @click.stop>
+                    <div v-if="openAccountMenuId === account.id" class="action-menu-popover account-menu-popover" :class="{ 'open-up': index > filteredAccounts.length - 4 }" @click.stop>
                       <button type="button" @click="openAccountMenuId = null; openAccountSettings(account)">账号设置</button>
                       <button type="button" @click="openAccountMenuId = null; resetQuota(account)">重置今日额度</button>
                       <button type="button" @click="openAccountMenuId = null; relogin(account)">清空登录状态</button>
@@ -804,6 +847,10 @@ onBeforeUnmount(() => {
           <label>
             <span>豆包入口地址</span>
             <input v-model="settingsForm.doubaoChatUrl" />
+          </label>
+          <label>
+            <span>Dola 入口地址</span>
+            <input v-model="settingsForm.dolaChatUrl" />
           </label>
           <label>
             <span>生成超时秒数</span>
@@ -1122,3 +1169,24 @@ onBeforeUnmount(() => {
     </div>
   </main>
 </template>
+
+<style scoped>
+.account-app-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 16px;
+  opacity: 0.85;
+}
+
+.account-app-badge.doubao {
+  color: #c8381f;
+}
+
+.account-app-badge.dola {
+  color: #2563eb;
+}
+</style>
