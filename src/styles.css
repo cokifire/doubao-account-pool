@@ -883,8 +883,17 @@ pre {
   top: calc(100% + 7px);
 }
 
+/* 接口日志 / 行动日志：标题与筛选固定，仅表格区域可滚动 */
 .logs-panel {
   min-height: calc(100vh - 152px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.logs-panel > .section-title,
+.logs-panel > .log-filters {
+  flex: 0 0 auto;
 }
 
 .log-filters {
