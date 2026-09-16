@@ -3,6 +3,7 @@ import Database from "better-sqlite3";
 import { app } from "electron";
 import type {
   Account,
+  AccountAppType,
   AccountCreateInput,
   AccountRuntimeStatus,
   AccountUpdateInput,
@@ -17,6 +18,11 @@ import type {
   OperationLogCreateInput
 } from "./types.js";
 import { generateFingerprint } from "./fingerprint.js";
+import {
+  appTypeFromPartition,
+  buildAccountPartition,
+  normalizeAppType
+} from "./app-site.js";
 
 /** 本地时间 ISO 字符串（含时区偏移，如 2026-08-26T21:30:00.123+08:00），跟随系统时区。 */
 function toLocalIso(date: Date): string {
@@ -69,6 +75,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   showExecutorWindow: false,
   autoCloseExecutorWindow: true,
   doubaoChatUrl: "https://www.doubao.com/chat",
+  dolaChatUrl: "https://dola.com/chat",
   defaultModel: "seedance_2_0_mini",
   dailyQuotaLimit: 10,
   miniCost: 2,
@@ -168,6 +175,7 @@ export class AppDatabase {
     return this.db.prepare(`
       SELECT
         id,
+        app_type AS appType,
         name,
         partition,
         remark,
@@ -194,6 +202,7 @@ export class AppDatabase {
     const account = this.db.prepare(`
       SELECT
         id,
+        app_type AS appType,
         name,
         partition,
         remark,
@@ -239,14 +248,16 @@ export class AppDatabase {
   createAccount(input: AccountCreateInput = {}): Account {
     const timestamp = now();
     const settings = this.getSettings();
-    const nextNumber = this.nextAccountNumber();
+    const appType = normalizeAppType(input.appType);
+    const nextNumber = this.nextAccountNumber(appType);
     const name = `账号 ${String(nextNumber).padStart(3, "0")}`;
-    const partition = `persist:doubao_account_${String(nextNumber).padStart(3, "0")}`;
+    const partition = buildAccountPartition(appType, nextNumber);
 
     const result = this.db.prepare(`
       INSERT INTO accounts (
         name,
         partition,
+        app_type,
         remark,
         login_status,
         current_status,
@@ -256,10 +267,11 @@ export class AppDatabase {
         created_at,
         updated_at
       )
-      VALUES (?, ?, ?, 'unknown', 'login_required', ?, ?, 0, ?, ?)
+      VALUES (?, ?, ?, ?, 'unknown', 'login_required', ?, ?, 0, ?, ?)
     `).run(
       name,
       partition,
+      appType,
       input.remark?.trim() || "",
       settings.dailyQuotaLimit,
       settings.dailyQuotaLimit,
@@ -406,6 +418,7 @@ export class AppDatabase {
     const found = this.db.prepare(`
       SELECT
         id,
+        app_type AS appType,
         name,
         partition,
         remark,
@@ -503,6 +516,7 @@ export class AppDatabase {
       showExecutorWindow: Boolean(input.showExecutorWindow ?? current.showExecutorWindow),
       autoCloseExecutorWindow: Boolean(input.autoCloseExecutorWindow ?? current.autoCloseExecutorWindow),
       doubaoChatUrl: String(input.doubaoChatUrl || current.doubaoChatUrl || DEFAULT_SETTINGS.doubaoChatUrl),
+      dolaChatUrl: String(input.dolaChatUrl || current.dolaChatUrl || DEFAULT_SETTINGS.dolaChatUrl),
       dailyQuotaLimit: clampInt(input.dailyQuotaLimit ?? current.dailyQuotaLimit),
       miniCost: Math.max(1, clampInt(input.miniCost ?? current.miniCost)),
       fastCost: Math.max(1, clampInt(input.fastCost ?? current.fastCost)),
@@ -770,6 +784,21 @@ export class AppDatabase {
       .run(migrationKey, timestamp);
   }
 
+  // 站点独立编号：豆包与 Dola 各自从 001 开始，分区形如
+  // persist:doubao_account_001 / persist:dola_account_001。
+  private nextAccountNumber(appType: AccountAppType): number {
+    const rows = this.db.prepare("SELECT partition FROM accounts").all() as Array<{ partition: string }>;
+    const used = rows
+      .filter((row) => appTypeFromPartition(row.partition) === appType)
+      .map((row) => row.partition.match(/_(\d+)$/)?.[1])
+      .filter((value): value is string => Boolean(value))
+      .map((value) => Number(value));
+
+    let current = 1;
+    while (used.includes(current)) current += 1;
+    return current;
+  }
+
   private ensureAccountColumns() {
     this.addColumnIfMissing("accounts", "name", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("accounts", "remark", "TEXT NOT NULL DEFAULT ''");
@@ -789,6 +818,16 @@ export class AppDatabase {
     this.addColumnIfMissing("accounts", "platform", "TEXT NOT NULL DEFAULT 'Win32'");
     this.addColumnIfMissing("accounts", "last_quota_reset_date", "TEXT");
     this.addColumnIfMissing("accounts", "enabled", "INTEGER NOT NULL DEFAULT 1");
+    // 先加可空列，再用分区前缀回填站点，避免 NOT NULL DEFAULT 把旧账号一律写成 doubao。
+    this.addColumnIfMissing("accounts", "app_type", "TEXT");
+
+    // 历史账号没有站点字段：按隔离分区回填（persist:dola_account_* → dola，其余 → doubao），
+    // 否则一旦用户手动改过分区前缀，账号会被当作豆包账号打开错误的站点。
+    this.db.prepare(`
+      UPDATE accounts
+      SET app_type = CASE WHEN partition LIKE '%dola\\_account\\_%' ESCAPE '\\' THEN 'dola' ELSE 'doubao' END
+      WHERE app_type IS NULL OR app_type = ''
+    `).run();
 
     this.db.prepare(`
       UPDATE accounts
@@ -880,17 +919,6 @@ export class AppDatabase {
     }
   }
 
-  private nextAccountNumber(): number {
-    const rows = this.db.prepare("SELECT partition FROM accounts").all() as Array<{ partition: string }>;
-    const used = rows
-      .map((row) => row.partition.match(/^persist:doubao_account_(\d+)$/)?.[1])
-      .filter((value): value is string => Boolean(value))
-      .map((value) => Number(value));
-
-    let current = 1;
-    while (used.includes(current)) current += 1;
-    return current;
-  }
 }
 
 function clampInt(value: number) {
@@ -924,6 +952,7 @@ function normalizeAccount(row: unknown): Account {
   const account = row as Account & { enabled: number | boolean };
   return {
     ...account,
+    appType: normalizeAppType(account.appType),
     enabled: Boolean(account.enabled)
   };
 }

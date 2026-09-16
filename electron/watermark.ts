@@ -1,3 +1,4 @@
+import { appSiteHostRegExpSource } from "./app-site.js";
 import type { AppSettings } from "./types.js";
 
 const VIDEO_URL_KEYS = [
@@ -42,9 +43,10 @@ export function getWatermarkRetryDelays(
   return WATERMARK_RETRY_DELAYS_MS.slice(0, attemptCount);
 }
 
-// 只有 /thread/（以及 /share/）才是豆包公开分享链接；
+// 只有 /thread/（以及 /share/）才是站点公开分享链接；
 // /chat/<id> 是需登录的会话页面地址，不是分享链接，不能用于去水印解析。
-const DOUBAO_SHARE_URL_RE = /^https?:\/\/(?:www\.)?doubao\.com\/(?:thread|share)\/[A-Za-z0-9._~-]+/i;
+// 豆包与 Dola 共用同一套路径结构，只有域名不同。
+const DOUBAO_SHARE_URL_RE = new RegExp(`^https?://${appSiteHostRegExpSource()}/(?:thread|share)/[A-Za-z0-9._~-]+`, "i");
 
 export function isValidDoubaoShareUrl(url: string) {
   return DOUBAO_SHARE_URL_RE.test(url);

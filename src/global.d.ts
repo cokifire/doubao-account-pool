@@ -1,5 +1,6 @@
 import type {
   Account,
+  AccountCreateInput,
   AccountUpdateInput,
   ApiRequest,
   ApiServerStatus,
@@ -13,7 +14,7 @@ declare global {
     doubaoManager: {
       accounts: {
         list: () => Promise<Account[]>;
-        create: (remark?: string) => Promise<Account>;
+        create: (input?: AccountCreateInput) => Promise<Account>;
         update: (input: AccountUpdateInput) => Promise<Account>;
         setEnabled: (id: number, enabled: boolean) => Promise<Account>;
         delete: (id: number) => Promise<boolean>;

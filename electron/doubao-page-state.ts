@@ -1,9 +1,14 @@
+import { appSiteHostRegExpSource, isAppSiteHostname } from "./app-site.js";
+
 export function normalizeComparableText(value: string) {
   return value.replace(/[^\p{L}\p{N}]+/gu, "").trim();
 }
 
-const DOUBAO_SHARE_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/(?:thread|share)\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
-const DOUBAO_CONVERSATION_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/chat\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
+// 豆包（doubao.com）与 Dola（dola.com）共用同一套前端，分享/会话地址只是域名不同，
+// 因此 URL 判定一律走这两个域名，不要把具体实现绑定到其中某一个站点上。
+const APP_SITE_HOST = appSiteHostRegExpSource();
+const DOUBAO_SHARE_URL_RE = new RegExp(`https?://${APP_SITE_HOST}/(?:thread|share)/[A-Za-z0-9._~-]+(?:[/?#][^\\s"'<>]*)?`, "i");
+const DOUBAO_CONVERSATION_URL_RE = new RegExp(`https?://${APP_SITE_HOST}/chat/[A-Za-z0-9._~-]+(?:[/?#][^\\s"'<>]*)?`, "i");
 
 export function extractDoubaoShareUrl(value: string | null | undefined) {
   if (!value) return null;
@@ -74,8 +79,8 @@ export function getNewDoubaoVideoUrls(currentUrls: string[], baselineUrls: strin
   return Array.from(new Set(currentUrls.filter((url) => {
     if (!/^https?:\/\//i.test(url) || baseline.has(url)) return false;
     try {
-      const hostname = new URL(url).hostname.toLowerCase();
-      return hostname !== "doubao.com" && hostname !== "www.doubao.com";
+      // 站点自身的地址（会话页、分享页）不算视频源，其余 CDN 才算。
+      return !isAppSiteHostname(new URL(url).hostname);
     } catch {
       return false;
     }

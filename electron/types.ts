@@ -1,11 +1,14 @@
 export type LoginStatus = "unknown" | "logged_in" | "logged_out";
 export type AccountRuntimeStatus = "idle" | "busy" | "error" | "login_required";
+/** 账号所属站点：豆包（国内版）或 Dola（海外版）。 */
+export type AccountAppType = "doubao" | "dola";
 export type DoubaoModel = "seedance_2_0_mini" | "seedance_2_0_fast";
 export type ApiRequestStatus = "accepted" | "running" | "success" | "failed" | "stopped";
 export type OperationLogStatus = "info" | "success" | "failed";
 
 export interface Account {
   id: number;
+  appType: AccountAppType;
   name: string;
   partition: string;
   remark: string;
@@ -27,6 +30,7 @@ export interface Account {
 
 export interface AccountCreateInput {
   remark?: string;
+  appType?: AccountAppType;
 }
 
 export interface AccountUpdateInput {
@@ -48,6 +52,7 @@ export interface AppSettings {
   showExecutorWindow: boolean;
   autoCloseExecutorWindow: boolean;
   doubaoChatUrl: string;
+  dolaChatUrl: string;
   defaultModel: DoubaoModel;
   dailyQuotaLimit: number;
   miniCost: number;

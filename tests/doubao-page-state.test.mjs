@@ -62,6 +62,42 @@ test('accepts only new HTTP video links for the current generation', () => {
     getNewDoubaoVideoUrls(['https://www.doubao.com/thread/xbsMtOGRraAcehDc8'], []),
     []
   )
+  // Dola 与豆包共用同一套前端，站点自身的地址同样不算视频源。
+  assert.deepEqual(
+    getNewDoubaoVideoUrls(['https://www.dola.com/thread/xbsMtOGRraAcehDc8'], []),
+    []
+  )
+  assert.deepEqual(
+    getNewDoubaoVideoUrls(['https://cdn.example.com/current.mp4'], []),
+    ['https://cdn.example.com/current.mp4']
+  )
+})
+
+test('treats Dola and Doubao share/conversation URLs the same way', () => {
+  // Dola 是豆包的海外版，两者前端一致，仅域名不同。
+  assert.equal(
+    extractDoubaoShareUrl('复制链接：https://www.dola.com/thread/abc_123?from=share。'),
+    'https://www.dola.com/thread/abc_123?from=share'
+  )
+  assert.equal(
+    extractDoubaoShareUrl('https://dola.com/share/share-123'),
+    'https://dola.com/share/share-123'
+  )
+  assert.equal(extractDoubaoShareUrl('https://www.dola.com/chat/chat_123'), null)
+
+  assert.equal(
+    extractDoubaoConversationUrl('https://www.dola.com/chat/38437129678594562'),
+    'https://www.dola.com/chat/38437129678594562'
+  )
+  assert.equal(
+    extractDoubaoConversationUrl('https://www.dola.com/chat/local_2452181702532277'),
+    'https://www.dola.com/chat/local_2452181702532277'
+  )
+  assert.equal(extractDoubaoConversationUrl('https://www.dola.com/thread/xZR7KqTbeRvEAjlB8'), null)
+  assert.equal(
+    isLocalDraftDoubaoConversationUrl('https://www.dola.com/chat/local_3921336934625024'),
+    true
+  )
 })
 
 test('recognizes only newly added page messages', () => {

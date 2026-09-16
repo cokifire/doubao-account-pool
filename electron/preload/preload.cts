@@ -1,10 +1,10 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AccountUpdateInput, AppSettingsUpdateInput } from "../types.js";
+import type { AccountCreateInput, AccountUpdateInput, AppSettingsUpdateInput } from "../types.js";
 
 const api = {
   accounts: {
     list: () => ipcRenderer.invoke("accounts:list"),
-    create: (remark?: string) => ipcRenderer.invoke("accounts:create", remark),
+    create: (input?: AccountCreateInput) => ipcRenderer.invoke("accounts:create", input),
     update: (input: AccountUpdateInput) => ipcRenderer.invoke("accounts:update", input),
     setEnabled: (id: number, enabled: boolean) => ipcRenderer.invoke("accounts:set-enabled", id, enabled),
     delete: (id: number) => ipcRenderer.invoke("accounts:delete", id),

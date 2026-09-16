@@ -22,6 +22,11 @@ import {
   normalizeComparableText
 } from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
+import {
+  appSiteHostRegExpSource,
+  appTypeLabel,
+  chatUrlForAppType
+} from "./app-site.js";
 import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoModel } from "./types.js";
 import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource } from "./watermark.js";
 
@@ -194,21 +199,22 @@ export class DoubaoExecutor {
     let win: BrowserWindow | null = null;
 
     try {
+      const siteLabel = appTypeLabel(account.appType);
       await this.updateProgress({
         requestId,
         status: "running",
-        message: "正在定位豆包已生成视频并重试复制分享链接"
+        message: `正在定位${siteLabel}已生成视频并重试复制分享链接`
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
       win = await this.createExecutionWindow(account, settings);
       this.activeWindows.set(requestId, win);
-      await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
+      await loadUrl(win, chatUrlForAppType(settings, account.appType));
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
 
       if (await looksLoggedOut(win)) {
-        throw new Error("豆包账号未登录，无法恢复视频结果");
+        throw new Error(`${siteLabel}账号未登录，无法恢复视频结果`);
       }
 
       const recovery = await findGeneratedConversationAndCopyShare(
@@ -218,14 +224,14 @@ export class DoubaoExecutor {
       );
       if (!recovery.shareUrl) {
         throw new Error(
-          `未找到可恢复的豆包视频：历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍未复制到分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
+          `未找到可恢复的${siteLabel}视频：历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍未复制到分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
         );
       }
       this.recordOperation(
         requestId,
         "复制分享地址",
         "success",
-        "已复制并确认豆包分享页包含视频资源",
+        `已复制并确认${siteLabel}分享页包含视频资源`,
         recovery.shareUrl
       );
       const resolvedVideo = await this.resolveCleanVideoForVerifiedShare(
@@ -279,6 +285,7 @@ export class DoubaoExecutor {
     }
 
     const settings = this.database.getSettings();
+    const siteLabel = appTypeLabel(account.appType);
     let win: BrowserWindow | null = null;
     let submittedToDoubao = false;
     let keepWindowOpen = false;
@@ -287,13 +294,13 @@ export class DoubaoExecutor {
       await this.updateProgress({
         requestId,
         status: "running",
-        message: "正在打开豆包执行窗口"
+        message: `正在打开${siteLabel}执行窗口`
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
       win = await this.createExecutionWindow(account, settings);
       this.activeWindows.set(requestId, win);
-      await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
+      await loadUrl(win, chatUrlForAppType(settings, account.appType));
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
 
@@ -307,13 +314,13 @@ export class DoubaoExecutor {
         if (!win.isVisible()) {
           win.show();
         }
-        throw new Error("豆包账号未登录，已打开登录窗口，请登录后重试");
+        throw new Error(`${siteLabel}账号未登录，已打开登录窗口，请登录后重试`);
       }
 
       await this.updateProgress({
         requestId,
         status: "running",
-        message: "正在切换豆包视频生成模式"
+        message: `正在切换${siteLabel}视频生成模式`
       });
       await activateVideoMode(win, request.model);
 
@@ -339,7 +346,7 @@ export class DoubaoExecutor {
       await this.updateProgress({
         requestId,
         status: "running",
-        message: "正在提交豆包生成"
+        message: `正在提交${siteLabel}生成`
       });
       const generationBaseline = await inspectGenerationPage(win);
       await submitPromptAndWait(win, request.model, request.prompt);
@@ -349,15 +356,15 @@ export class DoubaoExecutor {
         await this.updateProgress({
           requestId,
           status: "running",
-          message: "已记录本次豆包会话地址，等待视频完成",
+          message: `已记录本次${siteLabel}会话地址，等待视频完成`,
           doubaoThreadUrl: submittedConversationUrl
         });
       } else if (!(await isSubmissionConfirmedOnPage(win))) {
         // 提交后未等到正式会话地址，且页面也没有出现提交确认文案，
-        // 说明本次任务根本没有在豆包创建对话（提示词未真正发送成功）。
+        // 说明本次任务根本没有在站点创建对话（提示词未真正发送成功）。
         // 此时不设置 submittedToDoubao，任务快速失败并退还额度。
         throw new DoubaoPageFailureError(
-          "提交豆包后未检测到正式会话地址，豆包未真正创建本次对话，可能提示词未发送成功",
+          `提交${siteLabel}后未检测到正式会话地址，${siteLabel}未真正创建本次对话，可能提示词未发送成功`,
           true
         );
       } else {
@@ -367,7 +374,7 @@ export class DoubaoExecutor {
       await this.updateProgress({
         requestId,
         status: "running",
-        message: "已提交豆包，等待视频完成并复制分享链接"
+        message: `已提交${siteLabel}，等待视频完成并复制分享链接`
       });
 
       const generationResult = await waitForGenerationResult(
@@ -379,6 +386,7 @@ export class DoubaoExecutor {
         generationBaseline.videoCardCount,
         request.prompt,
         submittedConversationUrl,
+        siteLabel,
         async (message) => {
         await this.updateProgress({ requestId, status: "running", message });
         }
@@ -386,7 +394,7 @@ export class DoubaoExecutor {
 
       if (!generationResult.shareUrl) {
         throw new Error(
-          `视频已生成，但未提取到豆包分享链接，无法获取去水印视频${generationResult.shareFailureReason ? `（${generationResult.shareFailureReason}）` : ""}`
+          `视频已生成，但未提取到${siteLabel}分享链接，无法获取去水印视频${generationResult.shareFailureReason ? `（${generationResult.shareFailureReason}）` : ""}`
         );
       }
 
@@ -394,7 +402,7 @@ export class DoubaoExecutor {
         requestId,
         "复制分享地址",
         "success",
-        "已复制并确认豆包分享链接",
+        `已复制并确认${siteLabel}分享链接`,
         generationResult.shareUrl
       );
 
@@ -404,7 +412,7 @@ export class DoubaoExecutor {
       await this.updateProgress({
         requestId,
         status: "running",
-        message: "已确认豆包分享链接",
+        message: `已确认${siteLabel}分享链接`,
         doubaoThreadUrl: generationResult.shareUrl
       });
 
@@ -561,6 +569,7 @@ export class DoubaoExecutor {
 
   private async createExecutionWindow(account: Account, settings: AppSettings) {
     const titleName = account.remark || account.name;
+    const siteLabel = appTypeLabel(account.appType);
 
     // 应用该账号固定的设备指纹（UA + 基础硬件参数），与 partition 一一对应。
     const ses = session.fromPartition(account.partition);
@@ -575,7 +584,7 @@ export class DoubaoExecutor {
       width: 1320,
       height: 860,
       show: settings.showExecutorWindow,
-      title: `豆包执行器 - ${titleName}`,
+      title: `${siteLabel}执行器 - ${titleName}`,
       webPreferences: {
         partition: account.partition,
         contextIsolation: true,
@@ -1268,6 +1277,7 @@ async function waitForGenerationResult(
   baselineVideoCardCount: number,
   prompt: string,
   preferredConversationUrl: string | null,
+  siteLabel: string,
   onProgress: (message: string) => Promise<void> | void
 ): Promise<GenerationResult> {
   const timeoutMs = Math.max(60, timeoutSeconds || 900) * 1000;
@@ -1288,7 +1298,7 @@ async function waitForGenerationResult(
       : null;
     if (newFailureMessage) {
       throw new DoubaoPageFailureError(
-        `豆包已返回视频生成失败：${newFailureMessage}`,
+        `${siteLabel}已返回视频生成失败：${newFailureMessage}`,
         isQuotaNotChargedFailure(newFailureMessage)
       );
     }
@@ -1370,7 +1380,7 @@ async function waitForGenerationResult(
       lastProgressAt = Date.now();
       await onProgress(generatedAt
         ? `视频已生成，正在重试复制分享链接 ${Math.floor((Date.now() - generatedAt) / 1000)}s`
-        : `已提交豆包，等待生成完成 ${elapsedSeconds}s`);
+        : `已提交${siteLabel}，等待生成完成 ${elapsedSeconds}s`);
     }
     await wait(5000);
   }
@@ -1391,7 +1401,7 @@ async function waitForGenerationResult(
     return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
   }
   throw new Error(
-    `等待豆包视频生成超时；历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，未找到已生成视频`
+    `等待${siteLabel}视频生成超时；历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，未找到已生成视频`
   );
 }
 
@@ -1460,9 +1470,12 @@ async function findGeneratedConversationAndCopyShare(
   preferredConversationUrl: string | null = null
 ) {
   const normalizedPrompt = normalizeComparableText(prompt);
+  // 站点域名以字面量注入：这段脚本会跑在页面渲染进程里，拿不到任何模块级常量。
+  const siteHostRegExpSource = `^${appSiteHostRegExpSource()}$`;
   const candidates = await runPageScript<string[]>(win, `
     (() => {
       const prompt = ${JSON.stringify(normalizedPrompt)};
+      const siteHostRegExp = new RegExp(${JSON.stringify(siteHostRegExpSource)}, "i");
       const normalize = (value) => value.replace(/[^\\p{L}\\p{N}]+/gu, "").trim();
       const scoreLabel = (label) => {
         const normalizedLabel = normalize(label);
@@ -1484,7 +1497,7 @@ async function findGeneratedConversationAndCopyShare(
         .filter(({ href }) => {
           try {
             const url = new URL(href);
-            return /^(?:www\\.)?doubao\\.com$/i.test(url.hostname)
+            return siteHostRegExp.test(url.hostname)
               && /^\\/chat\\/[A-Za-z0-9._~-]+/i.test(url.pathname);
           } catch {
             return false;
@@ -2403,11 +2416,12 @@ function operationAction(message: string, status?: ApiRequestStatus) {
   if (status === "failed") return "任务失败";
   if (message.includes("上传参考图")) return "上传参考图";
   if (message.includes("填写提示词")) return "填写提示词";
-  if (message.includes("切换豆包视频生成模式")) return "切换视频生成模式";
-  if (message.includes("提交豆包")) return "提交视频任务";
+  // 这些文案里的站点名（豆包 / Dola）由账号所属站点决定，因此只匹配动作部分。
+  if (message.includes("切换") && message.includes("视频生成模式")) return "切换视频生成模式";
+  if (message.includes("正在提交") || message.includes("已提交")) return "提交视频任务";
   if (message.includes("复制分享")) return "复制分享地址";
   if (message.includes("去水印")) return "去水印解析";
-  if (message.includes("等待视频") || message.includes("定位豆包")) return "等待视频结果";
+  if (message.includes("等待视频") || message.includes("定位")) return "等待视频结果";
   return "任务进度";
 }
 

@@ -14,6 +14,9 @@ test('accepts real Doubao share link shapes', () => {
   assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/thread/xbFzZPi2eseSsvsO8'), true)
   assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/share/abcd1234?x=1'), true)
   assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/thread/xbFzZPi2eseSsvsO8/posts?fid=1'), true)
+  // Dola（海外版）与豆包共用同一套分享页路径。
+  assert.equal(isValidDoubaoShareUrl('https://www.dola.com/thread/xbFzZPi2eseSsvsO8'), true)
+  assert.equal(isValidDoubaoShareUrl('https://dola.com/share/abcd1234?x=1'), true)
 })
 
 test('rejects chat URLs (login-required, not share links) and garbage', () => {
@@ -25,6 +28,8 @@ test('rejects chat URLs (login-required, not share links) and garbage', () => {
   assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/chat/1234abcd'), false)
   assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/chat/local_0000000000000000000000'), false)
   assert.equal(isValidDoubaoShareUrl('https://www.doubao.com/chat/38438949252373250'), false)
+  assert.equal(isValidDoubaoShareUrl('https://www.dola.com/chat/38438949252373250'), false)
+  assert.equal(isValidDoubaoShareUrl('https://www.dola.com/search?q=video'), false)
 })
 
 test('extracts a nested MP4 result', () => {

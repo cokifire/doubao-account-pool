@@ -10,8 +10,10 @@ import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
 import { toPublicApiRequest } from "./public-api.js";
 import { buildFingerprintPreloadScript } from "./fingerprint.js";
+import { LOGIN_SESSION_COOKIE_RE, appTypeLabel, authUrlForAppType, chatUrlForAppType } from "./app-site.js";
 import type {
   Account,
+  AccountCreateInput,
   AccountUpdateInput,
   ApiRequest,
   ApiServerStatus,
@@ -359,18 +361,19 @@ function createMainWindow() {
   }
 }
 
-function createDoubaoWindow(accountId: number) {
+function createAccountWindow(accountId: number) {
   const account = db.getAccount(accountId);
   if (!account) throw new Error("Account not found");
 
   // 应用该账号固定的设备指纹（UA + 基础硬件参数），与 partition 一一对应。
   void applyAccountFingerprint(account);
 
+  const siteLabel = appTypeLabel(account.appType);
   const titleName = account.remark || account.name;
   const win = new BrowserWindow({
     width: 1320,
     height: 860,
-    title: `豆包 - ${titleName}`,
+    title: `${siteLabel} - ${titleName}`,
     webPreferences: {
       partition: account.partition,
       contextIsolation: true,
@@ -379,7 +382,7 @@ function createDoubaoWindow(accountId: number) {
     }
   });
 
-  void win.loadURL("https://www.doubao.com/chat");
+  void win.loadURL(chatUrlForAppType(db.getSettings(), account.appType));
 }
 
 async function detectLoginStatus(accountId: number) {
@@ -387,12 +390,11 @@ async function detectLoginStatus(accountId: number) {
   if (!account) throw new Error("Account not found");
 
   const accountSession = session.fromPartition(account.partition);
-  const cookies = await accountSession.cookies.get({ url: "https://www.doubao.com" });
+  const cookies = await accountSession.cookies.get({ url: authUrlForAppType(account.appType) });
 
   // 真正登录后才会写入的会话标识 cookie（未登录状态不含这些）
-  const hasSessionCookie = cookies.some((c) =>
-    /^(sessionid|sessionid_ss|sid_tt|sid_guard|uid_tt|uid_tt_ss)$/i.test(c.name)
-  );
+  // 两个站点共用字节跳动的 passport 体系，cookie 名称一致。
+  const hasSessionCookie = cookies.some((c) => LOGIN_SESSION_COOKIE_RE.test(c.name));
 
   const activeRequest = db.listApiRequests(1000).some((request) =>
     request.accountId === accountId && (request.status === "accepted" || request.status === "running")
@@ -433,8 +435,8 @@ async function clearAccountSession(accountId: number) {
 
 function registerIpc() {
   ipcMain.handle("accounts:list", () => db.listAccounts());
-  ipcMain.handle("accounts:create", (_event, remark?: string) => {
-    const account = db.createAccount({ remark });
+  ipcMain.handle("accounts:create", (_event, input?: AccountCreateInput | string) => {
+    const account = db.createAccount(typeof input === "string" ? { remark: input } : input || {});
     recordOperation(null, account.id, "创建账号", "success", `已创建 ${account.partition}`);
     return account;
   });
@@ -456,14 +458,17 @@ function registerIpc() {
     return true;
   });
   ipcMain.handle("accounts:open", (_event, id: number) => {
-    const result = createDoubaoWindow(id);
-    recordOperation(null, id, "打开豆包窗口", "success", "已打开独立账号窗口");
-    return result;
+    const account = db.getAccount(id);
+    createAccountWindow(id);
+    const siteLabel = account ? appTypeLabel(account.appType) : "账号";
+    recordOperation(null, id, `打开${siteLabel}窗口`, "success", `已打开独立${siteLabel}窗口`);
   });
   ipcMain.handle("accounts:relogin", async (_event, id: number) => {
     await clearAccountSession(id);
-    createDoubaoWindow(id);
-    recordOperation(null, id, "重新登录账号", "success", "已清空登录状态并打开登录窗口");
+    const account = db.getAccount(id);
+    createAccountWindow(id);
+    const siteLabel = account ? appTypeLabel(account.appType) : "账号";
+    recordOperation(null, id, "重新登录账号", "success", `已清空登录状态并打开${siteLabel}登录窗口`);
     return true;
   });
   ipcMain.handle("accounts:detect-login", async (_event, id: number) => {
