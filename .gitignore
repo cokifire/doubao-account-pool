@@ -23,4 +23,5 @@ tmp/
 temp/
 .codebuddy/
 .playwright/
-
+.playwright-cli/
+.codebuddy/memory/

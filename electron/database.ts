@@ -17,7 +17,7 @@ import type {
   OperationLog,
   OperationLogCreateInput
 } from "./types.js";
-import { generateFingerprint } from "./fingerprint.js";
+import { generateFingerprint, platformForUserAgent } from "./fingerprint.js";
 import {
   appTypeFromPartition,
   buildAccountPartition,
@@ -841,6 +841,8 @@ export class AppDatabase {
 
     // 回填空设备指纹列（旧库中可能存在 NULL 或空值，触发 NOT NULL 约束）。
     this.backfillFingerprints();
+    // 修正 UA 与 platform 自相矛盾的历史数据。
+    this.repairInconsistentPlatforms();
   }
 
   // 为每个账号补齐固定的设备指纹，保证 user_agent / platform 非空且
@@ -876,6 +878,23 @@ export class AppDatabase {
         fp.platform || "Win32",
         row.id
       );
+    }
+  }
+
+  // 修正历史账号里 UA 与 platform 自相矛盾的数据（早期版本两者独立取值导致）。
+  // 例如 UA 声称 Macintosh 而 platform 却是 Win32，这类矛盾会被 Google 等风控
+  // 直接判定为伪造浏览器。这里保持 UA 不变，只把 platform 纠正为与 UA 匹配的值。
+  private repairInconsistentPlatforms() {
+    const rows = this.db.prepare(
+      "SELECT id, user_agent, platform FROM accounts"
+    ).all() as Array<{ id: number; user_agent: string | null; platform: string | null }>;
+    const update = this.db.prepare("UPDATE accounts SET platform = ? WHERE id = ?");
+    for (const row of rows) {
+      if (!row.user_agent || row.user_agent === "") continue;
+      const expected = platformForUserAgent(row.user_agent);
+      if (row.platform !== expected) {
+        update.run(expected, row.id);
+      }
     }
   }
 

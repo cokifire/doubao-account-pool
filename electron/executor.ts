@@ -84,6 +84,9 @@ const SHARE_PANEL_WAIT_MS = 3500;
 const CLIPBOARD_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
 const VIDEO_CARD_WAIT_MS = 15000;
+// 历史恢复用更短的探针：主流程已超时后才兜底，视频通常已渲染，无需长等；
+// 旧会话里没有视频卡时会很快返回，避免对每个无关节话逐个等满 VIDEO_CARD_WAIT_MS。
+const RECOVERY_VIDEO_PROBE_MS = 6000;
 // 豆包分享链接是复制时刻的页面快照：视频刚生成完时分享，快照可能不包含视频卡，
 // 去水印接口将永远解析不到资源。复制后需打开分享页验证渲染结果，缺失则等待后
 // 重新分享（每次分享生成新的快照），直到分享页确认包含视频或尝试次数用尽。
@@ -323,6 +326,10 @@ export class DoubaoExecutor {
         message: `正在切换${siteLabel}视频生成模式`
       });
       await activateVideoMode(win, request.model);
+
+      // 前一次失败的任务可能在输入框/参考图区残留内容，先清理一遍，
+      // 否则新提示词会和旧的拼接、参考图也会叠加。
+      await clearComposer(win);
 
       const referenceImagePaths = request.referenceImagePaths && request.referenceImagePaths.length
         ? request.referenceImagePaths
@@ -760,6 +767,7 @@ async function fillPrompt(win: BrowserWindow, prompt: string) {
       label: "insertText",
       run: async () => {
         await sendMouseClick(win, target.x, target.y);
+        await sendKeyboard(win, "A", ["control"], 100);
         await sendKeyboard(win, "A", ["meta"], 100);
         await sendKeyboard(win, "Backspace", undefined, 100);
         await win.webContents.insertText(prompt);
@@ -772,6 +780,7 @@ async function fillPrompt(win: BrowserWindow, prompt: string) {
         const before = clipboard.readText();
         clipboard.writeText(prompt);
         await sendMouseClick(win, target.x, target.y);
+        await sendKeyboard(win, "A", ["control"], 100);
         await sendKeyboard(win, "A", ["meta"], 100);
         await sendKeyboard(win, "Backspace", undefined, 100);
         await sendKeyboard(win, "V", ["meta"], 900);
@@ -801,6 +810,71 @@ async function fillPrompt(win: BrowserWindow, prompt: string) {
 
   const diagnostics = await inspectComposer(win, prompt);
   throw new Error(`豆包输入框没有真正接收本次提示词（已尝试 ${tried.join("、")}；${formatComposerDiagnostics(diagnostics)}）`);
+}
+
+/**
+ * 每次任务开始前清理输入框与残留参考图：前一次失败的任务可能把提示词文本、
+ * 参考图缩略图留在当前会话的输入框里，不清会导致新提示词与旧内容拼接、图片叠加。
+ * 文本用跨平台“全选+删除”清空（Windows 用 Ctrl，macOS 用 Meta），并兜底直接置空；
+ * 参考图缩略图逐个点击其删除按钮移除。
+ */
+async function clearComposer(win: BrowserWindow) {
+  const target = await findComposerTarget(win);
+  if (!target) return;
+
+  await sendMouseClick(win, target.x, target.y);
+  // 跨平台全选：Windows 用 Ctrl+A，macOS 用 Meta+A（meta 在 Windows 上是 Win 键，不能全选）。
+  await sendKeyboard(win, "A", ["control"], 80);
+  await sendKeyboard(win, "A", ["meta"], 80);
+  await sendKeyboard(win, "Backspace", undefined, 120);
+  await sendKeyboard(win, "Delete", undefined, 120);
+
+  await removeExistingReferenceImages(win);
+  await wait(300);
+
+  // 文本兜底：上面删除失败（例如编辑器内部状态未注册）时直接置空。
+  const diagnostics = await inspectComposer(win);
+  if (diagnostics.textLength > 0) {
+    await setComposerTextDirectly(win, "");
+    await wait(300);
+  }
+}
+
+/**
+ * 移除输入框预览区里已存在的参考图缩略图（前一次失败任务遗留）。
+ * 实测 DOM（豆包/Dola 视频生成的输入区）：
+ *   div.thumb-card-xxxx[data-kind="image"]
+ *     ├─ div.thumb-placeholder-xxxx   // 缩略图本身不是 <img>
+ *     └─ button.delete-btn-xxxx > svg // “×” 删除按钮，只在鼠标悬浮时显形
+ * 删除按钮是悬浮才出现的，所以直接派发 mouse/click 事件调用它，不依赖可见性或坐标。
+ */
+async function removeExistingReferenceImages(win: BrowserWindow) {
+  for (let pass = 0; pass < 3; pass += 1) {
+    const removed = await runPageScript<number>(win, `
+      (() => {
+        const cards = Array.from(document.querySelectorAll('[class*="thumb-card"]'));
+        let count = 0;
+        for (const card of cards) {
+          const button = card.querySelector('button[class*="delete-btn"]')
+            || card.querySelector('button[class*="delete"]');
+          if (!button) continue;
+          // 先悬浮卡片（部分实现用 :hover 控制显隐），再依次派发 mousedown/mouseup/click，
+          // 兼容只监听 click 或 mousedown 的实现。
+          card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+          const fire = (type) => button.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, view: window, button: 0
+          }));
+          fire('mousedown');
+          fire('mouseup');
+          fire('click');
+          count += 1;
+        }
+        return count;
+      })()
+    `);
+    if (removed <= 0) return;
+    await wait(300 + removed * 150);
+  }
 }
 
 function isComposerSendable(input: Awaited<ReturnType<typeof inspectComposer>>) {
@@ -1356,11 +1430,11 @@ async function waitForGenerationResult(
       historyFallbackAttempted = true;
       await onProgress("当前执行窗口未同步完成状态，正在检查该账号最近对话");
       const originalUrl = win.webContents.getURL();
-      const currentConversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
+      // 记录会话必须与当前地址一起传入：当前地址可能只是上一次检查遗留的陌生会话。
       const recovery = await findGeneratedConversationAndCopyShare(
         win,
         prompt,
-        currentConversationUrl || preferredConversationUrl
+        [preferredConversationUrl, win.webContents.getURL()]
       );
       if (recovery.shareUrl) {
         return { shareUrl: recovery.shareUrl, directVideoUrl };
@@ -1392,7 +1466,7 @@ async function waitForGenerationResult(
   const recovery = await findGeneratedConversationAndCopyShare(
     win,
     prompt,
-    extractDoubaoConversationUrl(win.webContents.getURL()) || preferredConversationUrl
+    [preferredConversationUrl, win.webContents.getURL()]
   );
   if (recovery.shareUrl) {
     return { shareUrl: recovery.shareUrl, directVideoUrl };
@@ -1401,7 +1475,8 @@ async function waitForGenerationResult(
     return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
   }
   throw new Error(
-    `等待${siteLabel}视频生成超时；历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，未找到已生成视频`
+    `等待${siteLabel}视频生成超时；历史链接 ${recovery.candidateCount} 条，`
+    + `已检查 ${recovery.visitedCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，未找到已生成视频`
   );
 }
 
@@ -1467,33 +1542,22 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
 async function findGeneratedConversationAndCopyShare(
   win: BrowserWindow,
   prompt: string,
-  preferredConversationUrl: string | null = null
+  preferredConversationUrl: string | null | Array<string | null> = null
 ) {
   const normalizedPrompt = normalizeComparableText(prompt);
+  // 本次提交记录的会话可能有多个来源（记录地址 / 当前地址），全部保留、按序优先。
+  const preferredUrls = (Array.isArray(preferredConversationUrl)
+    ? preferredConversationUrl
+    : [preferredConversationUrl])
+    .map((value) => extractDoubaoConversationUrl(value))
+    .filter((value): value is string => Boolean(value));
   // 站点域名以字面量注入：这段脚本会跑在页面渲染进程里，拿不到任何模块级常量。
   const siteHostRegExpSource = `^${appSiteHostRegExpSource()}$`;
   const candidates = await runPageScript<string[]>(win, `
     (() => {
-      const prompt = ${JSON.stringify(normalizedPrompt)};
       const siteHostRegExp = new RegExp(${JSON.stringify(siteHostRegExpSource)}, "i");
-      const normalize = (value) => value.replace(/[^\\p{L}\\p{N}]+/gu, "").trim();
-      const scoreLabel = (label) => {
-        const normalizedLabel = normalize(label);
-        if (!normalizedLabel) return 0;
-        if (prompt.includes(normalizedLabel)) return 10000 + normalizedLabel.length;
-        let bigramMatches = 0;
-        for (let index = 0; index < normalizedLabel.length - 1; index += 1) {
-          if (prompt.includes(normalizedLabel.slice(index, index + 2))) bigramMatches += 1;
-        }
-        return bigramMatches * 100 + Math.min(normalizedLabel.length, 20);
-      };
       const links = Array.from(document.querySelectorAll('a[href]'))
-        .map((link, index) => ({
-          href: link.href,
-          label: [link.innerText, link.textContent, link.getAttribute("aria-label"), link.getAttribute("title")]
-            .filter(Boolean).join(" "),
-          index
-        }))
+        .map((link, index) => ({ href: link.href, index }))
         .filter(({ href }) => {
           try {
             const url = new URL(href);
@@ -1502,20 +1566,22 @@ async function findGeneratedConversationAndCopyShare(
           } catch {
             return false;
           }
-        })
-        .map((item) => ({ ...item, score: scoreLabel(item.label) }));
+        });
       const unique = Array.from(new Map(links.map((item) => [item.href, item])).values());
+      // 按 DOM（侧边栏“最近”列表）顺序返回：会话越新排在越前面。
+      // 匹配目标会话不再依赖提示词，直接以最新对话优先。
       return unique
-        .sort((a, b) => b.score - a.score || a.index - b.index)
+        .sort((a, b) => a.index - b.index)
         .map((item) => item.href)
         .slice(0, 30);
     })()
   `);
-  const preferredUrl = extractDoubaoConversationUrl(preferredConversationUrl);
+  // 记录会话必须排在最前：即使窗口此刻停在别的会话上，也不能把它丢掉。
+  // 之前“当前地址 || 记录地址”的写法会让恢复只查陌生会话（表现为“未找到已生成视频”）。
   const orderedCandidates = Array.from(new Set([
-    preferredUrl,
+    ...preferredUrls,
     ...candidates
-  ].filter((value): value is string => Boolean(value))));
+  ]));
   const signatureLength = Math.min(42, normalizedPrompt.length);
   const signatureSpan = Math.max(0, normalizedPrompt.length - signatureLength);
   const signatures = Array.from(new Set([0, 0.25, 0.5, 0.75, 1]
@@ -1529,33 +1595,42 @@ async function findGeneratedConversationAndCopyShare(
   let generatedMatchCount = 0;
   let shareFailureReason: string | null = null;
 
-  for (const candidate of orderedCandidates) {
-    try {
-      // A stale conversation link must not block recovery indefinitely. The
-      // newest conversation is normally near the front of this list.
-      await loadUrl(win, candidate, 8000);
-    } catch (error) {
-      console.warn("跳过无法加载的豆包历史对话", candidate, error);
-      continue;
+  // 历史恢复只深检最近的若干会话：优先当前/首选会话，再按“最近”列表顺序，
+  // 避免对已完成的旧会话逐个长等（每个无视频会话会等满探针超时）。
+  const inspectionCandidates = orderedCandidates.slice(0, 10);
+  let visitedCount = 0;
+  for (const candidate of inspectionCandidates) {
+    if (extractDoubaoConversationUrl(win.webContents.getURL()) !== candidate) {
+      try {
+        // A stale conversation link must not block recovery indefinitely. The
+        // newest conversation is normally near the front of this list.
+        await loadUrl(win, candidate, 8000);
+      } catch (error) {
+        console.warn("跳过无法加载的豆包历史对话", candidate, error);
+        continue;
+      }
+      await wait(600);
+      await dismissDoubaoDesktopDownloadPrompt(win);
     }
-    await wait(600);
-    await dismissDoubaoDesktopDownloadPrompt(win);
+    visitedCount += 1;
 
+    // 读取页面文本仅用于诊断计数；提示词命中不再作为准入闸门：
+    // 站点可能改写提示词、页面文本也可能未渲染，用提示词卡掉候选会误伤正确会话。
     let pageText = "";
-    let matchedPrompt = false;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       pageText = await runPageScript<string>(win, `document.body?.innerText || ""`);
-      const normalizedPageText = normalizeComparableText(pageText);
-      const signatureMatches = signatures.filter((signature) => normalizedPageText.includes(signature)).length;
-      matchedPrompt = normalizedPageText.includes(normalizedPrompt)
-        || signatureMatches >= requiredSignatureMatches;
-      if (matchedPrompt) break;
+      if (pageText.trim()) break;
       await wait(350);
     }
-    if (!matchedPrompt) continue;
-    promptMatchCount += 1;
+    const normalizedPageText = normalizeComparableText(pageText);
+    const signatureMatches = signatures.filter((signature) => normalizedPageText.includes(signature)).length;
+    if (normalizedPageText.includes(normalizedPrompt) || signatureMatches >= requiredSignatureMatches) {
+      promptMatchCount += 1;
+    }
 
-    const pageState = await waitForGeneratedVideoCard(win, VIDEO_CARD_WAIT_MS);
+    // 记录会话就是本次任务的归属会话，给它完整等待；其余旧会话仍用短探针避免逐个长等。
+    const probeMs = preferredUrls.includes(candidate) ? VIDEO_CARD_WAIT_MS : RECOVERY_VIDEO_PROBE_MS;
+    const pageState = await waitForGeneratedVideoCard(win, probeMs);
     if (!pageState.generated || pageState.failed) continue;
     if (pageState.videoCardCount <= 0) {
       shareFailureReason = "匹配对话已完成，但视频卡片仍未渲染";
@@ -1570,6 +1645,7 @@ async function findGeneratedConversationAndCopyShare(
         return {
           shareUrl: copied.shareUrl,
           candidateCount: orderedCandidates.length,
+          visitedCount,
           promptMatchCount,
           generatedMatchCount,
           shareFailureReason: null
@@ -1580,9 +1656,32 @@ async function findGeneratedConversationAndCopyShare(
     }
   }
 
+  // 恢复失败时把窗口停回记录会话，让后续排查（诊断截图）看到的是本次任务的会话，
+  // 而不是遍历过程中最后停留的某个无关会话。
+  if (preferredUrls[0]) {
+    try {
+      await loadUrl(win, preferredUrls[0], 8000);
+    } catch (error) {
+      console.warn("恢复失败后未能回到记录会话", preferredUrls[0], error);
+    }
+  }
+
+  // 未恢复成功时把检查结果打到日志里：下次排查能直接看出
+  // 记录会话是否有效、候选列表到底包含哪些会话。
+  console.warn("豆包历史会话恢复失败", JSON.stringify({
+    preferredUrls,
+    candidateCount: orderedCandidates.length,
+    inspectionCandidates,
+    visitedCount,
+    promptMatchCount,
+    generatedMatchCount,
+    shareFailureReason
+  }));
+
   return {
     shareUrl: null,
     candidateCount: orderedCandidates.length,
+    visitedCount,
     promptMatchCount,
     generatedMatchCount,
     shareFailureReason
@@ -2262,16 +2361,32 @@ async function findOverflowMenuPoint(win: BrowserWindow) {
   `);
 }
 
+/**
+ * 等待本次提交落到（或新建出）的正式会话地址。
+ * 提示词真正发送成功后，豆包会把 /chat/local_... 本地草稿地址切换为服务端正式会话地址。
+ * 但若打开账号时正停在前一次任务的旧会话上（失败任务残留的常见状态），初始地址就已经是
+ * 正式会话，不能立刻认定它就是本次会话——本次提交很可能另行创建了新会话。
+ * 因此要等地址稳定一小段时间，并在地址变化时采用变化后的新地址。
+ */
 async function waitForSubmittedConversationUrl(win: BrowserWindow, timeoutMs = 8000) {
   let conversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
+  let stableSince = Date.now();
   const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs
-    && (!conversationUrl || isLocalDraftDoubaoConversationUrl(conversationUrl))) {
+  while (Date.now() - startedAt < timeoutMs) {
     await wait(200);
     const currentUrl = extractDoubaoConversationUrl(win.webContents.getURL());
-    if (currentUrl) conversationUrl = currentUrl;
+    if (currentUrl && currentUrl !== conversationUrl) {
+      // 草稿转正、或本次提交另建了新会话：一律以变化后的新地址为准。
+      conversationUrl = currentUrl;
+      stableSince = Date.now();
+      continue;
+    }
+    if (conversationUrl
+      && !isLocalDraftDoubaoConversationUrl(conversationUrl)
+      && Date.now() - stableSince >= 1000) {
+      break;
+    }
   }
-  // 提示词真正发送成功后，豆包会把 /chat/local_... 本地草稿地址切换为服务端正式会话地址。
   // 若等待超时后仍是草稿地址，说明本次任务没有真正创建豆包会话，
   // 此时不能把草稿地址当作正式会话返回，返回 null 交由上层判定失败。
   if (!conversationUrl || isLocalDraftDoubaoConversationUrl(conversationUrl)) {

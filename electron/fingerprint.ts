@@ -16,18 +16,27 @@ function getChromiumMajorVersion(): string {
   return "136";
 }
 
-const WINDOWS_PLATFORMS = ["Win32", "Win32", "Win32", "Linux x86_64", "MacIntel"] as const;
 const HARDWARE_CONCURRENCY_POOL = [4, 8, 8, 12, 16, 6, 10] as const;
 const DEVICE_MEMORY_POOL = [4, 8, 8, 16] as const;
 
+// UA 与 platform 必须成对出现，否则会出现「UA 声称 Macintosh、navigator.platform 却是 Win32」
+// 这类自相矛盾的信号，被风控（如 Google 登录）直接判定为伪造浏览器。
+// 因此这里把两者绑定成同一条 profile，一次取值保证永远一致。
+interface DeviceProfile {
+  system: string;
+  platform: string;
+}
+const DEVICE_PROFILES: ReadonlyArray<DeviceProfile> = [
+  { system: "Windows NT 10.0; Win64; x64", platform: "Win32" },
+  { system: "Windows NT 10.0; WOW64", platform: "Win32" },
+  { system: "Macintosh; Intel Mac OS X 10_15_7", platform: "MacIntel" },
+  { system: "X11; Linux x86_64", platform: "Linux x86_64" },
+  { system: "Windows NT 11.0; Win64; x64", platform: "Win32" }
+];
+
 // UA 模板使用 {chromeVersion} 占位，由运行时真实 Chromium 版本填充。
-const USER_AGENT_TEMPLATES = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chromeVersion}.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chromeVersion}.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chromeVersion}.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chromeVersion}.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chromeVersion}.0.0.0 Safari/537.36"
-] as const;
+const USER_AGENT_TEMPLATE =
+  "Mozilla/5.0 ({system}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chromeVersion}.0.0.0 Safari/537.36";
 
 // 惰性计算一次实际 Chromium 主版本号，供 UA 与 userAgentData brands 共用。
 let cachedChromeMajor: string | null = null;
@@ -57,12 +66,29 @@ export interface AccountFingerprint {
 export function generateFingerprint(accountId: number): AccountFingerprint {
   const seed = accountId * 2654435761;
   const chromeMajor = chromeMajorVersion();
+  // 一次选出 profile，UA 与 platform 来自同一条记录，天然一致。
+  const profile = pick(DEVICE_PROFILES, seed);
   return {
-    userAgent: pick(USER_AGENT_TEMPLATES, seed).replace("{chromeVersion}", chromeMajor),
+    userAgent: buildUserAgent(profile.system, chromeMajor),
     hardwareConcurrency: pick(HARDWARE_CONCURRENCY_POOL, seed >> 3),
     deviceMemory: pick(DEVICE_MEMORY_POOL, seed >> 5),
-    platform: pick(WINDOWS_PLATFORMS, seed >> 7)
+    platform: profile.platform
   };
+}
+
+function buildUserAgent(system: string, chromeMajor: string): string {
+  return USER_AGENT_TEMPLATE
+    .replace("{system}", system)
+    .replace("{chromeVersion}", chromeMajor);
+}
+
+// 从一段既有 UA 反推应匹配的 navigator.platform。
+// 用于修复历史账号中 UA 与 platform 不一致的数据（保持 UA 不变，只纠正 platform，
+// 以免改变已登录账号的会话特征）。
+export function platformForUserAgent(userAgent: string): string {
+  if (/Macintosh|Mac OS X/i.test(userAgent)) return "MacIntel";
+  if (/Linux/i.test(userAgent)) return "Linux x86_64";
+  return "Win32";
 }
 
 // 在渲染进程里覆盖 navigator 的基础硬件参数（UA 由 session.setUserAgent 处理，
