@@ -33,6 +33,18 @@ export interface AccountCreateInput {
   appType?: AccountAppType;
 }
 
+/** 从系统浏览器导入 Cookie 的结果（用于「系统浏览器登录 + Cookie 回灌」）。 */
+export interface CookieImportResult {
+  /** 成功写入隔离分区的条数。 */
+  imported: number;
+  /** 解析或写入失败的条数。 */
+  failed: number;
+  /** 写入的 cookie 涉及的域名（去重）。 */
+  domains: string[];
+  /** 回灌后重新检测出的登录状态。 */
+  loginStatus: LoginStatus;
+}
+
 export interface AccountUpdateInput {
   id: number;
   enabled?: boolean;

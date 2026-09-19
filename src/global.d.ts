@@ -6,6 +6,7 @@ import type {
   ApiServerStatus,
   AppSettings,
   AppSettingsUpdateInput,
+  CookieImportResult,
   OperationLog
 } from "../electron/types";
 
@@ -20,6 +21,8 @@ declare global {
         delete: (id: number) => Promise<boolean>;
         open: (id: number) => Promise<void>;
         relogin: (id: number) => Promise<boolean>;
+        openExternalLogin: (id: number) => Promise<string>;
+        importCookies: (id: number, raw: string) => Promise<CookieImportResult>;
         detectLogin: (id: number) => Promise<Account>;
         detectAll: () => Promise<Account[]>;
         resetQuota: (id: number) => Promise<Account>;

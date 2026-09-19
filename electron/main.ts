@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
-import { app, BrowserWindow, ipcMain, session } from "electron";
+import { app, BrowserWindow, ipcMain, session, shell } from "electron";
 import log from "electron-log/main.js";
 import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
@@ -19,6 +19,7 @@ import type {
   ApiServerStatus,
   AppSettings,
   AppSettingsUpdateInput,
+  CookieImportResult,
   DoubaoModel,
   GenerateRequestBody
 } from "./types.js";
@@ -433,6 +434,131 @@ async function clearAccountSession(accountId: number) {
   });
 }
 
+// —— 系统浏览器登录 + Cookie 回灌 ——
+//
+// Google 会拦截"嵌入在其他应用中"的浏览器（Electron 内嵌窗口即属此类），站内
+// Google 登录因此不可用。绕法：用系统真实浏览器完成登录，再把该站点的 Cookie
+// 导回这个账号自己的隔离分区，之后自动化执行仍走 Electron 窗口，不受影响。
+
+/** 常见 Cookie 导出工具（EditThisCookie / Cookie Editor 等）的单条记录。 */
+interface ExportedCookie {
+  name?: unknown;
+  value?: unknown;
+  domain?: unknown;
+  path?: unknown;
+  secure?: unknown;
+  httpOnly?: unknown;
+  expirationDate?: unknown;
+  sameSite?: unknown;
+  session?: unknown;
+}
+
+function normalizeSameSite(value: unknown): "unspecified" | "no_restriction" | "lax" | "strict" {
+  const raw = String(value ?? "").toLowerCase();
+  if (raw === "no_restriction" || raw === "none") return "no_restriction";
+  if (raw === "lax") return "lax";
+  if (raw === "strict") return "strict";
+  return "unspecified";
+}
+
+/** 由 domain 反推 cookies.set 必需的 url；domain 常带前导点（.dola.com）。 */
+function urlForCookieDomain(domain: string, cookiePath: string): string | null {
+  const host = domain.replace(/^\./, "").trim();
+  if (!host) return null;
+  const safePath = cookiePath.startsWith("/") ? cookiePath : "/";
+  try {
+    return new URL(`https://${host}${safePath}`).toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 解析导入文本。支持 Cookie 导出工具的 JSON 数组，
+ * 也容忍 { cookies: [...] } 包裹，以及单条对象。
+ */
+function parseExportedCookies(raw: string): ExportedCookie[] {
+  const text = raw.trim();
+  if (!text) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("Cookie 内容不是合法 JSON，请粘贴从浏览器导出的 JSON 数组");
+  }
+  const list = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray((parsed as { cookies?: unknown[] } | null)?.cookies)
+      ? (parsed as { cookies: unknown[] }).cookies
+      : [parsed];
+  return list.filter((item): item is ExportedCookie => Boolean(item) && typeof item === "object");
+}
+
+/** 把导入的 Cookie 写入该账号的隔离分区，并重新检测登录状态。 */
+async function importAccountCookies(accountId: number, raw: string): Promise<CookieImportResult> {
+  const account = db.getAccount(accountId);
+  if (!account) throw new Error("Account not found");
+
+  const entries = parseExportedCookies(raw);
+  if (entries.length === 0) throw new Error("没有解析到任何 Cookie");
+
+  const accountSession = session.fromPartition(account.partition);
+  const domains = new Set<string>();
+  let imported = 0;
+  let failed = 0;
+
+  for (const entry of entries) {
+    const name = typeof entry.name === "string" ? entry.name : "";
+    const value = typeof entry.value === "string" ? entry.value : "";
+    if (!name) {
+      failed += 1;
+      continue;
+    }
+    const domain = typeof entry.domain === "string" ? entry.domain : "";
+    const cookiePath = typeof entry.path === "string" && entry.path ? entry.path : "/";
+    const url = urlForCookieDomain(domain, cookiePath);
+    if (!url) {
+      failed += 1;
+      continue;
+    }
+
+    const details: Electron.CookiesSetDetails = {
+      url,
+      name,
+      value,
+      path: cookiePath,
+      secure: entry.secure === true,
+      httpOnly: entry.httpOnly === true,
+      sameSite: normalizeSameSite(entry.sameSite)
+    };
+    if (domain) details.domain = domain;
+
+    // expirationDate：Chrome 扩展导出的是秒，少数工具给毫秒，这里统一成秒。
+    const rawExpiry = typeof entry.expirationDate === "number" ? entry.expirationDate : null;
+    if (rawExpiry !== null && entry.session !== true) {
+      details.expirationDate = rawExpiry > 1e12 ? Math.round(rawExpiry / 1000) : Math.round(rawExpiry);
+    }
+
+    try {
+      await accountSession.cookies.set(details);
+      imported += 1;
+      if (domain) domains.add(domain.replace(/^\./, ""));
+    } catch {
+      failed += 1;
+    }
+  }
+
+  if (imported === 0) throw new Error(`Cookie 全部写入失败（${failed} 条），请确认导出内容包含 domain 字段`);
+
+  const updated = await detectLoginStatus(accountId);
+  return {
+    imported,
+    failed,
+    domains: [...domains].sort(),
+    loginStatus: updated.loginStatus
+  };
+}
+
 function registerIpc() {
   ipcMain.handle("accounts:list", () => db.listAccounts());
   ipcMain.handle("accounts:create", (_event, input?: AccountCreateInput | string) => {
@@ -470,6 +596,30 @@ function registerIpc() {
     const siteLabel = account ? appTypeLabel(account.appType) : "账号";
     recordOperation(null, id, "重新登录账号", "success", `已清空登录状态并打开${siteLabel}登录窗口`);
     return true;
+  });
+  // 在系统默认浏览器里打开该账号站点的登录页，绕开 Google 对嵌入式浏览器的封堵。
+  ipcMain.handle("accounts:open-external-login", async (_event, id: number) => {
+    const account = db.getAccount(id);
+    if (!account) throw new Error("Account not found");
+    const url = chatUrlForAppType(db.getSettings(), account.appType);
+    await shell.openExternal(url);
+    const siteLabel = appTypeLabel(account.appType);
+    recordOperation(null, id, `系统浏览器登录${siteLabel}`, "success", `已在系统浏览器打开 ${url}`);
+    return url;
+  });
+  ipcMain.handle("accounts:import-cookies", async (_event, id: number, raw: string) => {
+    const result = await importAccountCookies(id, String(raw || ""));
+    const account = db.getAccount(id);
+    const siteLabel = account ? appTypeLabel(account.appType) : "账号";
+    recordOperation(
+      null,
+      id,
+      `导入${siteLabel} Cookie`,
+      "success",
+      `成功 ${result.imported} 条，失败 ${result.failed} 条，登录状态：${result.loginStatus}`
+    );
+    notifyDataChanged();
+    return result;
   });
   ipcMain.handle("accounts:detect-login", async (_event, id: number) => {
     const account = await detectLoginStatus(id);

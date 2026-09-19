@@ -8,6 +8,7 @@ import type {
   ApiRequestStatus,
   ApiServerStatus,
   AppSettings,
+  CookieImportResult,
   DoubaoModel,
   LoginStatus,
   OperationLog,
@@ -43,6 +44,12 @@ const logStatusFilter = ref<"all" | ApiRequestStatus>("all");
 const operationSearch = ref("");
 const operationStatusFilter = ref<"all" | OperationLogStatus>("all");
 const copiedField = ref<"prompt" | "result" | null>(null);
+// 系统浏览器登录 + Cookie 回灌
+const cookieImportAccount = ref<Account | null>(null);
+const cookieImportText = ref("");
+const cookieImportResult = ref<CookieImportResult | null>(null);
+const cookieImportBusy = ref(false);
+const cookieImportError = ref("");
 
 const accountSettingsForm = reactive({
   remark: "",
@@ -286,6 +293,47 @@ async function relogin(account: Account) {
   if (!window.confirm(`清空 ${account.partition} 的登录状态并重新打开${appTypeLabel(account)}？`)) return;
   await window.doubaoManager.accounts.relogin(account.id);
   await refresh();
+}
+
+// Google 不允许在嵌入浏览器（Electron 内嵌窗口）里登录，所以改用系统浏览器
+// 登录，再把该站点的 Cookie 导回这个账号的隔离分区。
+async function loginInSystemBrowser(account: Account) {
+  await window.doubaoManager.accounts.openExternalLogin(account.id);
+  openCookieImport(account);
+}
+
+function openCookieImport(account: Account) {
+  cookieImportAccount.value = account;
+  cookieImportText.value = "";
+  cookieImportResult.value = null;
+  cookieImportBusy.value = false;
+  cookieImportError.value = "";
+}
+
+function closeCookieImport() {
+  cookieImportAccount.value = null;
+  cookieImportText.value = "";
+  cookieImportResult.value = null;
+  cookieImportError.value = "";
+}
+
+async function submitCookieImport() {
+  const account = cookieImportAccount.value;
+  if (!account || cookieImportBusy.value) return;
+  cookieImportBusy.value = true;
+  cookieImportError.value = "";
+  cookieImportResult.value = null;
+  try {
+    cookieImportResult.value = await window.doubaoManager.accounts.importCookies(
+      account.id,
+      cookieImportText.value
+    );
+    await refresh();
+  } catch (error) {
+    cookieImportError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    cookieImportBusy.value = false;
+  }
 }
 
 async function deleteAccount(account: Account) {
@@ -758,6 +806,8 @@ onBeforeUnmount(() => {
                     <div v-if="openAccountMenuId === account.id" class="action-menu-popover account-menu-popover" :class="{ 'open-up': index > filteredAccounts.length - 4 }" @click.stop>
                       <button type="button" @click="openAccountMenuId = null; openAccountSettings(account)">账号设置</button>
                       <button type="button" @click="openAccountMenuId = null; resetQuota(account)">重置今日额度</button>
+                      <button type="button" @click="openAccountMenuId = null; loginInSystemBrowser(account)">系统浏览器登录</button>
+                      <button type="button" @click="openAccountMenuId = null; openCookieImport(account)">导入 Cookie</button>
                       <button type="button" @click="openAccountMenuId = null; relogin(account)">清空登录状态</button>
                       <span class="menu-separator"></span>
                       <button class="danger-text" type="button" @click="openAccountMenuId = null; deleteAccount(account)">删除账号</button>
@@ -1167,6 +1217,54 @@ onBeforeUnmount(() => {
         </div>
       </form>
     </div>
+
+    <div v-if="cookieImportAccount" class="modal-backdrop" @click.self="closeCookieImport">
+      <form class="modal" @submit.prevent="submitCookieImport">
+        <div class="modal-header">
+          <div>
+            <h2>系统浏览器登录 / 导入 Cookie</h2>
+            <p>{{ accountCode(cookieImportAccount) }} / {{ cookieImportAccount.partition }}</p>
+          </div>
+          <button class="icon-button" type="button" @click="closeCookieImport">关闭</button>
+        </div>
+
+        <ol class="cookie-steps">
+          <li>点「在系统浏览器打开」，用真实浏览器完成 Google 登录。</li>
+          <li>登录后，用 Cookie 导出扩展（如 EditThisCookie、Cookie Editor）导出该站点的 Cookie，选 JSON 格式并复制。</li>
+          <li>把 JSON 粘贴到下面，点「导入 Cookie」。</li>
+        </ol>
+
+        <label>
+          <span>Cookie JSON</span>
+          <textarea
+            v-model="cookieImportText"
+            class="cookie-textarea"
+            rows="8"
+            placeholder='[{"name":"sessionid","value":"...","domain":".dola.com","path":"/","secure":true,"httpOnly":true}]'
+          ></textarea>
+        </label>
+
+        <div v-if="cookieImportError" class="cookie-error">{{ cookieImportError }}</div>
+
+        <div v-if="cookieImportResult" class="cookie-success">
+          成功写入 {{ cookieImportResult.imported }} 条，失败 {{ cookieImportResult.failed }} 条。
+          登录状态：{{ cookieImportResult.loginStatus }}
+          <span v-if="cookieImportResult.domains.length">
+            域名：{{ cookieImportResult.domains.join("、") }}
+          </span>
+        </div>
+
+        <div class="modal-actions">
+          <button class="button" type="button" @click="loginInSystemBrowser(cookieImportAccount)">
+            在系统浏览器打开
+          </button>
+          <button class="button primary" type="submit" :disabled="cookieImportBusy || !cookieImportText.trim()">
+            {{ cookieImportBusy ? "导入中…" : "导入 Cookie" }}
+          </button>
+          <button class="button" type="button" @click="closeCookieImport">取消</button>
+        </div>
+      </form>
+    </div>
   </main>
 </template>
 
@@ -1188,5 +1286,38 @@ onBeforeUnmount(() => {
 
 .account-app-badge.dola {
   color: #2563eb;
+}
+
+.cookie-steps {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-muted, #6b7280);
+}
+
+.cookie-textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.cookie-error {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(220, 38, 38, 0.1);
+  color: #dc2626;
+  font-size: 12px;
+}
+
+.cookie-success {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(22, 163, 74, 0.1);
+  color: #16a34a;
+  font-size: 12px;
+  line-height: 1.6;
 }
 </style>

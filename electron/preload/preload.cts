@@ -10,6 +10,10 @@ const api = {
     delete: (id: number) => ipcRenderer.invoke("accounts:delete", id),
     open: (id: number) => ipcRenderer.invoke("accounts:open", id),
     relogin: (id: number) => ipcRenderer.invoke("accounts:relogin", id),
+    // 在系统默认浏览器打开登录页（绕开 Google 对嵌入浏览器的封堵），
+    // 登录后把 Cookie 导回来写进该账号的隔离分区。
+    openExternalLogin: (id: number) => ipcRenderer.invoke("accounts:open-external-login", id),
+    importCookies: (id: number, raw: string) => ipcRenderer.invoke("accounts:import-cookies", id, raw),
     detectLogin: (id: number) => ipcRenderer.invoke("accounts:detect-login", id),
     detectAll: () => ipcRenderer.invoke("accounts:detect-all"),
     resetQuota: (id: number) => ipcRenderer.invoke("accounts:reset-quota", id),
