@@ -43,6 +43,8 @@ export interface CookieImportResult {
   domains: string[];
   /** 回灌后重新检测出的登录状态。 */
   loginStatus: LoginStatus;
+  /** 回读分区后发现的登录凭证 Cookie 名（sessionid 等）；为空说明登录凭证没落地。 */
+  sessionCookieNames: string[];
 }
 
 export interface AccountUpdateInput {

@@ -1252,6 +1252,13 @@ onBeforeUnmount(() => {
           <span v-if="cookieImportResult.domains.length">
             域名：{{ cookieImportResult.domains.join("、") }}
           </span>
+          <div v-if="cookieImportResult.sessionCookieNames.length">
+            登录凭证 Cookie：{{ cookieImportResult.sessionCookieNames.join("、") }}
+          </div>
+          <div v-else class="cookie-hint">
+            分区里没有 sessionid 等登录凭证 Cookie。请确认：①在系统浏览器里已登录成功；
+            ②导出的是 dola.com 页面下的 Cookie（不是 Google 的）；③导出后没有先退出登录。
+          </div>
         </div>
 
         <div class="modal-actions">
@@ -1319,5 +1326,10 @@ onBeforeUnmount(() => {
   color: #16a34a;
   font-size: 12px;
   line-height: 1.6;
+}
+
+.cookie-hint {
+  margin-top: 6px;
+  color: #b45309;
 }
 </style>

@@ -451,6 +451,16 @@ interface ExportedCookie {
   expirationDate?: unknown;
   sameSite?: unknown;
   session?: unknown;
+  hostOnly?: unknown;
+}
+
+/** 把导出记录的字段名统一成小写键。不同导出工具大小写不一（value / Value），必须兼容。 */
+function normalizeCookieKeys(entry: Record<string, unknown>): ExportedCookie {
+  const out: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(entry)) {
+    out[key.toLowerCase()] = val;
+  }
+  return out as ExportedCookie;
 }
 
 function normalizeSameSite(value: unknown): "unspecified" | "no_restriction" | "lax" | "strict" {
@@ -491,7 +501,9 @@ function parseExportedCookies(raw: string): ExportedCookie[] {
     : Array.isArray((parsed as { cookies?: unknown[] } | null)?.cookies)
       ? (parsed as { cookies: unknown[] }).cookies
       : [parsed];
-  return list.filter((item): item is ExportedCookie => Boolean(item) && typeof item === "object");
+  return list
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map(normalizeCookieKeys);
 }
 
 /** 把导入的 Cookie 写入该账号的隔离分区，并重新检测登录状态。 */
@@ -510,7 +522,9 @@ async function importAccountCookies(accountId: number, raw: string): Promise<Coo
   for (const entry of entries) {
     const name = typeof entry.name === "string" ? entry.name : "";
     const value = typeof entry.value === "string" ? entry.value : "";
-    if (!name) {
+    // name 和 value 必须都非空。空 value 的 Cookie 写进去也无效，
+    // 还会让"导入成功"的假象掩盖真实问题（曾因导出工具用 "Value" 大写键踩过）。
+    if (!name || !value) {
       failed += 1;
       continue;
     }
@@ -531,7 +545,13 @@ async function importAccountCookies(accountId: number, raw: string): Promise<Coo
       httpOnly: entry.httpOnly === true,
       sameSite: normalizeSameSite(entry.sameSite)
     };
-    if (domain) details.domain = domain;
+    if (domain) {
+      // hostOnly=true 表示该 Cookie 只属于这个主机（domain 不带前导点）；
+      // 否则补上前导点变成域 Cookie，子域名（www.dola.com）也能收到。
+      details.domain = entry.hostOnly === true || domain.startsWith(".")
+        ? domain
+        : `.${domain}`;
+    }
 
     // expirationDate：Chrome 扩展导出的是秒，少数工具给毫秒，这里统一成秒。
     const rawExpiry = typeof entry.expirationDate === "number" ? entry.expirationDate : null;
@@ -548,14 +568,25 @@ async function importAccountCookies(accountId: number, raw: string): Promise<Coo
     }
   }
 
-  if (imported === 0) throw new Error(`Cookie 全部写入失败（${failed} 条），请确认导出内容包含 domain 字段`);
+  if (imported === 0) {
+    throw new Error(
+      `Cookie 全部写入失败（${failed} 条）。请确认导出的 JSON 里每条都有非空的 name 和 value 字段`
+    );
+  }
+
+  // 回读分区，确认登录凭证 Cookie 是否真的落地（诊断"导入成功但仍未登录"）。
+  const written = await accountSession.cookies.get({ url: authUrlForAppType(account.appType) });
+  const sessionCookieNames = written
+    .filter((cookie) => LOGIN_SESSION_COOKIE_RE.test(cookie.name))
+    .map((cookie) => cookie.name);
 
   const updated = await detectLoginStatus(accountId);
   return {
     imported,
     failed,
     domains: [...domains].sort(),
-    loginStatus: updated.loginStatus
+    loginStatus: updated.loginStatus,
+    sessionCookieNames: [...new Set(sessionCookieNames)].sort()
   };
 }
 
