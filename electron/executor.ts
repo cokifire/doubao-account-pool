@@ -87,6 +87,10 @@ const VIDEO_CARD_WAIT_MS = 15000;
 // 历史恢复用更短的探针：主流程已超时后才兜底，视频通常已渲染，无需长等；
 // 旧会话里没有视频卡时会很快返回，避免对每个无关节话逐个等满 VIDEO_CARD_WAIT_MS。
 const RECOVERY_VIDEO_PROBE_MS = 6000;
+// 豆包是 SPA，输入框在页面打开/模式切换后可能晚于脚本才挂载。单次 DOM 查询会
+// 把“还没渲染出来”误判成“页面没有输入框”，因此定位输入框一律走有界轮询。
+const COMPOSER_WAIT_MS = 10000;
+const COMPOSER_EDITABLE_SELECTOR = 'textarea, [contenteditable], [role="textbox"], input[type="text"]';
 // 豆包分享链接是复制时刻的页面快照：视频刚生成完时分享，快照可能不包含视频卡，
 // 去水印接口将永远解析不到资源。复制后需打开分享页验证渲染结果，缺失则等待后
 // 重新分享（每次分享生成新的快照），直到分享页确认包含视频或尝试次数用尽。
@@ -756,10 +760,10 @@ async function setFileInputs(win: BrowserWindow, filePaths: string[]) {
 }
 
 async function fillPrompt(win: BrowserWindow, prompt: string) {
-  const target = await findComposerTarget(win);
+  const target = await waitForComposerTarget(win);
 
   if (!target) {
-    throw new Error("没有找到豆包提示词输入框");
+    throw new Error(`没有找到豆包提示词输入框（${await describeComposerCandidates(win)}）`);
   }
 
   const attempts: Array<{ label: string; run: () => Promise<void> }> = [
@@ -819,7 +823,7 @@ async function fillPrompt(win: BrowserWindow, prompt: string) {
  * 参考图缩略图逐个点击其删除按钮移除。
  */
 async function clearComposer(win: BrowserWindow) {
-  const target = await findComposerTarget(win);
+  const target = await waitForComposerTarget(win);
   if (!target) return;
 
   await sendMouseClick(win, target.x, target.y);
@@ -890,8 +894,14 @@ async function findComposerTarget(win: BrowserWindow) {
         const style = getComputedStyle(el);
         return rect.width > 20 && rect.height > 20 && style.visibility !== "hidden" && style.display !== "none";
       };
-      const candidates = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input[type="text"]'))
-        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+      // contenteditable 还可能是 plaintext-only 等取值；只接受明确可编辑的取值，
+      // 排除 false/inherit（inherit 多见于包裹层，会把外层容器误当成输入框）。
+      const editable = (el) => {
+        const value = (el.getAttribute("contenteditable") ?? "").toLowerCase();
+        return value === "" || value === "true" || value === "plaintext-only";
+      };
+      const candidates = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_EDITABLE_SELECTOR)}))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly && editable(el))
         .map((el) => {
           const rect = el.getBoundingClientRect();
           const label = [
@@ -917,6 +927,51 @@ async function findComposerTarget(win: BrowserWindow) {
       };
     })()
   `);
+}
+
+/**
+ * 有界轮询等待输入框出现。页面刚打开、路由切换或模式切换后输入框可能尚未挂载，
+ * 单次查询会把“还没渲染”误判成“没有输入框”。
+ */
+async function waitForComposerTarget(win: BrowserWindow, timeoutMs = COMPOSER_WAIT_MS) {
+  const startedAt = Date.now();
+  let target = await findComposerTarget(win);
+  while (!target && Date.now() - startedAt < timeoutMs) {
+    await wait(300);
+    target = await findComposerTarget(win);
+  }
+  return target;
+}
+
+/**
+ * 定位输入框失败时把页面上所有可编辑元素dump出来：下次能直接看出是
+ * “页面还没渲染”“元素被 disabled/隐藏”，还是选择器没覆盖新的 DOM 结构。
+ */
+async function describeComposerCandidates(win: BrowserWindow) {
+  return runPageScript<string>(win, `
+    (() => {
+      const all = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_EDITABLE_SELECTOR)}));
+      const describe = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return [
+          el.tagName.toLowerCase(),
+          "ce=" + (el.getAttribute("contenteditable") ?? "-"),
+          "role=" + (el.getAttribute("role") ?? "-"),
+          "disabled=" + Boolean(el.disabled),
+          "readonly=" + Boolean(el.readOnly),
+          "rect=" + Math.round(rect.width) + "x" + Math.round(rect.height),
+          "display=" + style.display,
+          "vis=" + style.visibility
+        ].join(",");
+      };
+      return [
+        "url=" + location.href,
+        "total=" + all.length,
+        ...all.slice(0, 12).map((el, index) => index + ":" + describe(el))
+      ].join(" | ");
+    })()
+  `).catch(() => "无法读取输入框诊断信息");
 }
 
 async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
@@ -1363,6 +1418,21 @@ async function waitForGenerationResult(
   let directVideoUrl: string | null = null;
   let shareFailureReason: string | null = null;
   let historyFallbackAttempted = false;
+
+  // 提交后窗口可能并未停在本次会话上（停留在列表页/首页，或中途被重定向走），
+  // 主循环若直接在当前页轮询会长时间空等，最终只能靠历史兜底去找视频。
+  // 这里先确保窗口落在记录会话上，再开始轮询。
+  if (preferredConversationUrl
+    && extractDoubaoConversationUrl(win.webContents.getURL()) !== preferredConversationUrl) {
+    await onProgress("正在回到本次提交会话");
+    try {
+      await loadUrl(win, preferredConversationUrl, 8000);
+      await wait(800);
+      await dismissDoubaoDesktopDownloadPrompt(win);
+    } catch (error) {
+      console.warn("返回本次提交会话失败", preferredConversationUrl, error);
+    }
+  }
 
   while (Date.now() - startedAt < timeoutMs) {
     const pageState = await inspectGenerationPage(win);
