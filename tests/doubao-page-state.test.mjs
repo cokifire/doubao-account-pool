@@ -219,6 +219,18 @@ test('detects the Doubao desktop-download prompt that can block sharing', () => 
     isDoubaoDesktopDownloadPrompt('下载电脑版 使用完整功能 下载电脑版'),
     false
   )
+  assert.equal(
+    isDoubaoDesktopDownloadPrompt('下载电脑版 免费领取 30 天订阅 工作模式升级 PPT Excel 文档 代码 立即下载'),
+    true
+  )
+  assert.equal(
+    isDoubaoDesktopDownloadPrompt('下载豆包电脑版 免费领取 30 天订阅 立即下载'),
+    true
+  )
+  assert.equal(
+    isDoubaoDesktopDownloadPrompt('下载电脑版 免费领取'),
+    false
+  )
 })
 
 test('recognizes the completion text shown by Doubao video cards', () => {

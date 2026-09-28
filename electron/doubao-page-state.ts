@@ -50,9 +50,12 @@ export function isDoubaoPromptRewritePage(pageText: string) {
 
 export function isDoubaoDesktopDownloadPrompt(pageText: string) {
   const text = pageText.replace(/\s+/g, " ").trim();
-  return text.includes("下载电脑版")
+  const oldVariant = text.includes("下载电脑版")
     && text.includes("使用完整功能")
     && text.includes("下次提醒我");
+  const newVariant = (text.includes("下载电脑版") || text.includes("下载豆包电脑版"))
+    && text.includes("免费领取 30 天订阅");
+  return oldVariant || newVariant;
 }
 
 export function isDoubaoGenerationComplete(pageText: string) {
