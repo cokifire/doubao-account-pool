@@ -1894,8 +1894,22 @@ async function waitForGenerationResult(
     if (completionTextPresent && !completionTextSeenAt) {
       completionTextSeenAt = Date.now();
     }
+    const cardVisible = hasNewVideoSource
+      || newVideoCount > 0
+      || newPlayableVideoCount > 0
+      || newVideoCardCount > 0;
+    // 完成文案已出现但长时间采集不到视频卡片：隐藏执行窗口下豆包可能没有渲染卡片
+    // DOM（SPA 懒加载未触发）。临时显示并聚焦窗口，给页面一次真正渲染的机会。
+    if (completionTextSeenAt
+      && !cardVisible
+      && !win.isVisible()
+      && Date.now() - completionTextSeenAt > 30000) {
+      win.showInactive();
+      win.webContents.focus();
+    }
     // Doubao renders the completion text before the finished card. Do not share
     // until a new video card is present; a text-only result is not shareable.
+    // The grace period is the escape hatch when the card never renders.
     const generated = isGenerationReadyForShare({
       completionTextPresent,
       hasNewVideoSource,

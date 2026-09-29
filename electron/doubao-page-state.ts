@@ -102,10 +102,21 @@ export interface GenerationReadyInput {
 }
 
 /**
+ * 完成文案出现后等待视频卡片渲染的宽限期。
+ *
+ * 正常情况下豆包在文案出现后几秒内就会渲染出新视频卡片；隐藏执行窗口里
+ * 偶发不渲染卡片 DOM（SPA 懒加载未触发），此时继续等待没有意义，
+ * 超过宽限期后放行，避免任务一直空等到整体超时。
+ */
+export const DEFAULT_SHARE_GRACE_MS = 120000;
+
+/**
  * Decides whether a finished Doubao video is safe to share. Doubao renders the
  * "视频生成好了" text before the finished video card appears; copying the share
  * link in that window yields a thread URL without the video. A completion
- * message alone is never sufficient: the current task must have a new card.
+ * message alone is normally not sufficient: the current task must have a new
+ * card. When the card never renders (possible in a hidden execution window),
+ * the grace period is the escape hatch that keeps the task from hanging.
  */
 export function isGenerationReadyForShare(input: GenerationReadyInput) {
   if (!input.completionTextPresent) return false;
@@ -113,7 +124,10 @@ export function isGenerationReadyForShare(input: GenerationReadyInput) {
     || input.newVideoCount > 0
     || (input.newPlayableVideoCount || 0) > 0
     || (input.newVideoCardCount || 0) > 0;
-  return videoReady;
+  if (videoReady) return true;
+  const graceMs = input.graceMs ?? DEFAULT_SHARE_GRACE_MS;
+  if (!input.completionTextSeenAt) return false;
+  return input.now - input.completionTextSeenAt >= graceMs;
 }
 
 export function extractDoubaoFailureMessage(pageText: string) {

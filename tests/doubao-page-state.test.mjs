@@ -303,10 +303,15 @@ test('waits for a video element before treating the result as share-ready', () =
   assert.equal(isGenerationReadyForShare({ ...base, newVideoCardCount: 1, now: 3000 }), true)
   // Stale videos from earlier tasks do not count.
   assert.equal(isGenerationReadyForShare({ ...base, newVideoCount: 0, now: 3000 }), false)
-  // Completion text alone is never accepted as a share-ready result.
-  assert.equal(isGenerationReadyForShare({ ...base, now: 17000 }), false)
+  // Completion text alone is not accepted before the grace period elapses.
+  assert.equal(isGenerationReadyForShare({ ...base, now: 5000 }), false)
+  // Once the card never renders past the grace period, stop waiting for it;
+  // otherwise a hidden execution window hangs the task until the global timeout.
+  assert.equal(isGenerationReadyForShare({ ...base, now: 17000 }), true)
   // No completion text means never ready, even with videos on the page.
   assert.equal(isGenerationReadyForShare({ ...base, completionTextPresent: false, newVideoCount: 1, now: 17000 }), false)
   // Completion text seen but grace not yet elapsed still waits.
   assert.equal(isGenerationReadyForShare({ ...base, completionTextSeenAt: 0, now: 17000 }), false)
+  // The default grace period is long enough that a normal card render wins.
+  assert.equal(isGenerationReadyForShare({ ...base, graceMs: undefined, now: 10000 }), false)
 })
