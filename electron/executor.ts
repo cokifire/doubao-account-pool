@@ -2361,7 +2361,9 @@ async function tryCopyShareLink(win: BrowserWindow) {
 
       if (!shareState.active) {
         await openShareSelection(win);
-        const directlyCopiedUrl = extractDoubaoShareUrl(clipboard.readText());
+        // “复制分享链接”这类入口会直接写剪贴板，不会打开分享面板；
+        // 复制可能略有延迟，轮询剪贴板而不是只读一次。
+        const directlyCopiedUrl = await waitForClipboardShareUrl(CLIPBOARD_WAIT_MS);
         if (directlyCopiedUrl) {
           if (await acceptCopiedShareUrl(directlyCopiedUrl)) return result;
         }
@@ -2682,10 +2684,19 @@ async function openShareSelection(win: BrowserWindow) {
   const menuPoint = await findOverflowMenuPoint(win);
   if (menuPoint) {
     await sendMouseClick(win, menuPoint.x, menuPoint.y);
-    const menuSharePoint = await waitForTextControlPoint(win, ["分享"], ["分享图片"], 1800);
+    // 新版豆包头部“更多”菜单里直接是“复制分享链接”，点击后就把 /thread/ 链接写进剪贴板，
+    // 不会弹出分享面板。优先精确匹配这个文案，再回退到旧的“分享”子菜单路径。
+    const menuSharePoint = await waitForTextControlPoint(
+      win,
+      ["复制分享链接", "分享"],
+      ["分享图片"],
+      1800
+    );
     if (menuSharePoint) {
       await sendMouseClick(win, menuSharePoint.x, menuSharePoint.y);
       if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
+      // 如果点击的是“复制分享链接”，没有面板也不要直接放弃，让调用方去剪贴板里取链接。
+      if (menuSharePoint.debug.includes("复制分享链接")) return false;
     }
     // A wrong header candidate can open an unrelated popover. Close it before
     // trying the next fallback so the next click is not swallowed.
