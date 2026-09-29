@@ -18,10 +18,14 @@ import {
   isLocalDraftDoubaoConversationUrl,
   isGenerationReadyForShare,
   isPromptMovedOutOfComposer,
-  isQuotaNotChargedFailure,
   normalizeComparableText
 } from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
+import {
+  classifyDoubaoFailure,
+  shouldRefundQuota,
+  type DoubaoFailureCode
+} from "./failure-classification.js";
 import {
   appSiteHostRegExpSource,
   appTypeLabel,
@@ -51,10 +55,14 @@ type ShareCopyResult = {
   reason: string | null;
 };
 
+/** 页面侧失败：带结构化失败码，退款与终止策略由 failure-classification 统一决定。 */
 class DoubaoPageFailureError extends Error {
-  constructor(message: string, readonly refundQuota: boolean) {
+  readonly refundQuota: boolean;
+
+  constructor(message: string, readonly code: DoubaoFailureCode, refundQuota?: boolean) {
     super(message);
     this.name = "DoubaoPageFailureError";
+    this.refundQuota = refundQuota ?? shouldRefundQuota(code);
   }
 }
 
@@ -378,7 +386,7 @@ export class DoubaoExecutor {
         // 此时不设置 submittedToDoubao，任务快速失败并退还额度。
         throw new DoubaoPageFailureError(
           `提交${siteLabel}后未检测到正式会话地址，${siteLabel}未真正创建本次对话，可能提示词未发送成功`,
-          true
+          "submission_failed"
         );
       } else {
         submittedToDoubao = true;
@@ -460,13 +468,16 @@ export class DoubaoExecutor {
         win.close();
       }
     } catch (error) {
-      const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(error);
-      if (shouldRefundQuota) {
+      // 退款策略由失败码统一决定：未提交一律退，已提交则看平台是否真正扣费。
+      const failureCode: DoubaoFailureCode = error instanceof DoubaoPageFailureError ? error.code : "unknown";
+      const refundQuota = !submittedToDoubao
+        || (failureCode !== "unknown" && shouldRefundQuota(failureCode));
+      if (refundQuota) {
         this.database.refundQuota(account.id, request.model);
       }
       const diagnosticsDir = await captureExecutionDiagnostics(win, requestId);
       const suffix = diagnosticsDir ? `；诊断截图已保存到 ${diagnosticsDir}` : "";
-      await this.failRequest(request, errorMessage(error) + suffix, shouldRefundQuota);
+      await this.failRequest(request, errorMessage(error) + suffix, refundQuota);
       this.database.updateAccount({
         id: account.id,
         currentStatus: keepWindowOpen ? "login_required" : "idle"
@@ -1132,7 +1143,7 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
     if (result.failureMessage) {
       throw new DoubaoPageFailureError(
         `豆包提交后返回失败：${result.failureMessage}`,
-        isQuotaNotChargedFailure(result.failureMessage)
+        classifyDoubaoFailure(result.failureMessage)
       );
     }
     if (result.confirmed || result.sentEvidence) return;
@@ -1504,7 +1515,7 @@ async function waitForGenerationResult(
     if (newFailureMessage) {
       throw new DoubaoPageFailureError(
         `${siteLabel}已返回视频生成失败：${newFailureMessage}`,
-        isQuotaNotChargedFailure(newFailureMessage)
+        classifyDoubaoFailure(newFailureMessage)
       );
     }
 
@@ -2678,10 +2689,6 @@ function formatElapsed(milliseconds: number) {
 
 function formatWatermarkResolution(input: { elapsedMs: number; retryCount: number }) {
   return `耗时 ${formatElapsed(input.elapsedMs)}，第 ${input.retryCount + 1} 次解析`;
-}
-
-function isRefundableExecutionError(error: unknown) {
-  return error instanceof DoubaoPageFailureError && error.refundQuota;
 }
 
 function wait(ms: number) {
