@@ -27,6 +27,11 @@ import {
   type DoubaoFailureCode
 } from "./failure-classification.js";
 import {
+  detectPageBlocker,
+  type BlockerScanInput,
+  type BlockerScanResult
+} from "./page-blockers.js";
+import {
   appSiteHostRegExpSource,
   appTypeLabel,
   chatUrlForAppType
@@ -340,6 +345,15 @@ export class DoubaoExecutor {
         message: `正在切换${siteLabel}视频生成模式`
       });
       await activateVideoMode(win, request.model);
+
+      // 选模型本身就可能触发会员升级面板；此时尚未提交，fail-closed 只会退额度不提交。
+      const modeBlocker = await inspectPageBlockers(win);
+      if (modeBlocker.blocked) {
+        throw new DoubaoPageFailureError(
+          `${siteLabel}页面出现${describeBlocker(modeBlocker.code)}拦截，未提交提示词（${modeBlocker.evidence}）`,
+          modeBlocker.code
+        );
+      }
 
       // 前一次失败的任务可能在输入框/参考图区残留内容，先清理一遍，
       // 否则新提示词会和旧的拼接、参考图也会叠加。
@@ -1507,6 +1521,18 @@ async function waitForGenerationResult(
       }
     }
 
+    // 会员/权益/登录拦截：继续等待不会有结果，立即 fail-closed，让调度器换号。
+    // 视频一旦生成就不再扫描——分享面板等浮层可能带营销文案，避免误判。
+    if (!generatedAt) {
+      const blocker = await inspectPageBlockers(win);
+      if (blocker.blocked) {
+        throw new DoubaoPageFailureError(
+          `${siteLabel}页面出现${describeBlocker(blocker.code)}拦截，已停止等待（${blocker.evidence}）`,
+          blocker.code
+        );
+      }
+    }
+
     const pageState = await inspectGenerationPage(win);
     const newFailureMessage = pageState.failureMessage
       && hasNewTextOccurrence(pageState.pageText, baselineText, pageState.failureMessage)
@@ -1679,6 +1705,45 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
       };
     })()
   `);
+}
+
+/**
+ * 采集页面上的浮层文本与 iframe 描述符，交给纯函数判定是否存在会员/登录拦截。
+ * 这里只做「采集合格证据」，判定规则全部在 page-blockers.ts，便于单测与调整。
+ */
+async function inspectPageBlockers(win: BrowserWindow): Promise<BlockerScanResult> {
+  const input = await runPageScript<BlockerScanInput>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 20 && rect.height > 20 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const overlays = Array.from(document.querySelectorAll(
+        '[role="dialog"],[role="alert"],[class*="modal"],[class*="toast"],[class*="popover"],[class*="dialog"]'
+      )).filter(visible);
+      const overlayTexts = overlays
+        .map((el) => (el.innerText || "").replace(/\\s+/g, " ").trim())
+        .filter(Boolean)
+        .slice(0, 20);
+      const frameDescriptors = Array.from(document.querySelectorAll("iframe"))
+        .filter(visible)
+        .map((frame) => [frame.title, frame.name, frame.getAttribute("aria-label"), frame.src]
+          .filter(Boolean).join(" "))
+        .filter(Boolean)
+        .slice(0, 20);
+      return {
+        pageText: (document.body?.innerText || "").replace(/\\s+/g, " ").trim(),
+        overlayTexts,
+        frameDescriptors
+      };
+    })()
+  `);
+  return detectPageBlocker(input);
+}
+
+function describeBlocker(code: DoubaoFailureCode): string {
+  return code === "login_required" ? "登录" : "会员权益";
 }
 
 async function findGeneratedConversationAndCopyShare(
