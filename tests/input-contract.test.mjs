@@ -28,21 +28,40 @@ test('accepts duration and aspect ratio', () => {
 })
 
 test('accepts numeric duration from json callers', () => {
-  const result = normalizeGenerateInput({ prompt: 'x', duration: 10 }, defaults)
+  const result = normalizeGenerateInput({ prompt: 'x', duration: 10, aspectRatio: '16:9' }, defaults)
   assert.equal(result.ok, true)
   assert.equal(result.value.duration, '10s')
 })
 
 test('rejects an out-of-whitelist duration instead of ignoring it', () => {
-  const result = normalizeGenerateInput({ prompt: 'x', duration: '30s' }, defaults)
+  const result = normalizeGenerateInput({ prompt: 'x', duration: '30s', aspectRatio: '16:9' }, defaults)
   assert.equal(result.ok, false)
   assert.equal(result.error, 'unsupported duration')
 })
 
 test('rejects an out-of-whitelist aspect ratio', () => {
-  const result = normalizeGenerateInput({ prompt: 'x', aspectRatio: '1:2' }, defaults)
+  const result = normalizeGenerateInput({ prompt: 'x', duration: '10s', aspectRatio: '1:2' }, defaults)
   assert.equal(result.ok, false)
   assert.equal(result.error, 'unsupported aspectRatio')
+})
+
+test('rejects duration without aspectRatio', () => {
+  const result = normalizeGenerateInput({ prompt: 'x', duration: '10s' }, defaults)
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'duration and aspectRatio must be provided together')
+})
+
+test('rejects aspectRatio without duration', () => {
+  const result = normalizeGenerateInput({ prompt: 'x', aspectRatio: '16:9' }, defaults)
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'duration and aspectRatio must be provided together')
+})
+
+test('treats empty-string duration and aspectRatio as not provided', () => {
+  const result = normalizeGenerateInput({ prompt: 'x', duration: '', aspectRatio: '' }, defaults)
+  assert.equal(result.ok, true)
+  assert.equal(result.value.duration, null)
+  assert.equal(result.value.aspectRatio, null)
 })
 
 test('rejects an empty prompt', () => {

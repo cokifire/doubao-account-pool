@@ -22,7 +22,7 @@ export interface NormalizedGenerateInput {
   referenceImagePaths: string[];
   callbackUrl: string | null;
   source: string;
-  /** null 表示未指定，执行器不会去动页面上的时长 / 比例控件。 */
+  /** 与 aspectRatio 成对出现；两个都是 null 时执行器不会去动页面上的时长 / 比例控件。 */
   duration: VideoDuration | null;
   aspectRatio: VideoAspectRatio | null;
 }
@@ -42,6 +42,15 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * 判断可选参数是否真的被传入。
+ * multipart 会把缺失字段变成空字符串，JSON 调用方则可能显式传 null，
+ * 这三种都按「没传」处理，避免把空值当成一次配置请求。
+ */
+function isPresent(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== "";
 }
 
 /** 回调地址必须是不带凭据的 http(s)，避免把回调打到意外协议或泄露账号口令。 */
@@ -113,12 +122,16 @@ export function normalizeGenerateInput(
   const callback = normalizeCallbackUrl(raw.callbackUrl);
   if ("error" in callback) return { ok: false, error: callback.error };
 
-  // 时长 / 比例是可选的，但一旦传了就必须是白名单里的值：静默忽略会让调用方
-  // 以为参数生效了，结果拿到的是豆包默认时长。
-  const hasDuration = raw.duration !== undefined && raw.duration !== null && raw.duration !== "";
+  // 时长 / 比例要么都不传（沿用豆包默认），要么成对传：只传一个会让调用方
+  // 以为另一个也按预期走了，实际拿到的是豆包自己的默认值。
+  const hasDuration = isPresent(raw.duration);
+  const hasAspectRatio = isPresent(raw.aspectRatio);
+  if (hasDuration !== hasAspectRatio) {
+    return { ok: false, error: "duration and aspectRatio must be provided together" };
+  }
+  // 传了就必须是白名单里的值：静默忽略会让调用方以为参数生效了。
   const duration = hasDuration ? normalizeVideoDuration(raw.duration) : null;
   if (hasDuration && !duration) return { ok: false, error: "unsupported duration" };
-  const hasAspectRatio = raw.aspectRatio !== undefined && raw.aspectRatio !== null && raw.aspectRatio !== "";
   const aspectRatio = hasAspectRatio ? normalizeVideoAspectRatio(raw.aspectRatio) : null;
   if (hasAspectRatio && !aspectRatio) return { ok: false, error: "unsupported aspectRatio" };
 

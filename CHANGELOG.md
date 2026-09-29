@@ -12,7 +12,7 @@
 - 页面控件就绪统一走有界等待 + 连续稳定采样（`electron/readiness.ts`），替代固定 sleep；超时返回带阶段名的诊断（如 `model_control_not_ready`）。
 - 生成接口入参加白名单契约（`electron/input-contract.ts`）：prompt 长度上限 4000、callbackUrl 必须是无凭据的 http(s)、参考图列表支持数组 / JSON 数组 / 逗号分隔且不超过 10 张、source 截断到 64 字符，非法入参直接返回 400。
 - 应用设置读写共用一套归一化（`electron/settings-contract.ts`）：端口越界回退默认，超时 / 并发 / 重试 / 额度 / 单次消耗夹回合法范围，dailyResetTime 与 defaultModel 走白名单，数据库中被改脏的值读出即被修正。
-- 对外接口支持可选的视频时长与比例：`duration`（`4s`–`15s`）与 `aspectRatio`（`1:1` / `3:4` / `4:3` / `9:16` / `16:9` / `21:9`）。未传时沿用豆包默认参数，行为与此前完全一致；传入非白名单值直接返回 400，不静默忽略。配置流程移植自 doubao-studio 的 `configureVideoOptionsV2`（`electron/video-config.ts` + `executor.ts` 的 `configureVideoParameters`）：只点击页面可见控件，比例走「比例 · 时长」组合控件的精确选项，时长走滑杆真实键盘事件，每一步都回读校验失败即 fail-closed 退额度。任务状态与回调报文回显 `duration` / `aspectRatio`。
+- 对外接口支持可选的视频时长与比例：`duration`（`4s`–`15s`）与 `aspectRatio`（`1:1` / `3:4` / `4:3` / `9:16` / `16:9` / `21:9`）。两个参数**必须成对传入**：都不传时沿用豆包默认参数，行为与此前完全一致；只传一个返回 400 `duration and aspectRatio must be provided together`（只传一个会让调用方误以为另一个也生效了）；传入非白名单值同样返回 400，不静默忽略。配置流程移植自 doubao-studio 的 `configureVideoOptionsV2`（`electron/video-config.ts` + `executor.ts` 的 `configureVideoParameters`）：只点击页面可见控件，比例走「比例 · 时长」组合控件的精确选项，时长走滑杆真实键盘事件，每一步都回读校验失败即 fail-closed 退额度。任务状态与回调报文回显 `duration` / `aspectRatio`。
 
 ### 修复
 
