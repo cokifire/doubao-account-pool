@@ -9,6 +9,7 @@ import log from "electron-log/main.js";
 import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
 import { toPublicApiRequest } from "./public-api.js";
+import { normalizeGenerateInput } from "./input-contract.js";
 import { buildFingerprintPreloadScript } from "./fingerprint.js";
 import { LOGIN_SESSION_COOKIE_RE, appTypeLabel, authUrlForAppType, chatUrlForAppType } from "./app-site.js";
 import type {
@@ -184,19 +185,22 @@ class LocalApiServer {
       if (request.method === "POST" && requestUrl.pathname === "/api/generate") {
         const requestId = `doubao-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
         const body = await readGenerateRequest(request, requestId);
-        const prompt = body.prompt?.trim();
-        if (!prompt) {
-          sendJson(response, 400, { error: "prompt is required" });
+        // 入参一律先过契约：multipart/JSON 都会把字段变成字符串，脏值不能流进队列。
+        const input = normalizeGenerateInput(body, {
+          defaultModel: settings.defaultModel,
+          maxReferenceImages: MAX_REFERENCE_IMAGES
+        });
+        if (!input.ok) {
+          sendJson(response, 400, { error: input.error });
           return;
         }
-
-        const model = normalizeModel(body.model || settings.defaultModel);
-        if (!model) {
-          sendJson(response, 400, { error: "unsupported model" });
-          return;
-        }
+        const { model, prompt } = input.value;
 
         const referenceImagePath = await prepareReferenceImage(body, requestId);
+        // 契约里没传参考图列表时退回单张字段，保持既有行为。
+        const referenceImagePaths = input.value.referenceImagePaths.length
+          ? input.value.referenceImagePaths
+          : (referenceImagePath ? [referenceImagePath] : []);
         const account = settings.executorEnabled
           ? this.database.reserveAvailableAccount(model)
           : this.database.findAvailableAccount(model);
@@ -205,15 +209,15 @@ class LocalApiServer {
         if (!account) {
           const failed = this.database.createApiRequest({
             requestId,
-            source: body.source,
+            source: input.value.source,
             model,
             status: "failed",
             message: "没有可用账号，或该模型剩余额度不足",
             prompt,
             referenceImagePath,
-            referenceImagePaths: body.referenceImagePaths || (referenceImagePath ? [referenceImagePath] : []),
+            referenceImagePaths,
             removeWatermark: true,
-            callbackUrl: body.callbackUrl
+            callbackUrl: input.value.callbackUrl
           });
           this.database.appendOperationLog({
             requestId,
@@ -230,7 +234,7 @@ class LocalApiServer {
         this.database.deductQuota(account.id, model);
         const created = this.database.createApiRequest({
           requestId,
-          source: body.source,
+          source: input.value.source,
           model,
           accountId: account.id,
           status: "accepted",
@@ -239,9 +243,9 @@ class LocalApiServer {
             : `已接收，已预扣 ${cost} 额度，自动执行已关闭`,
           prompt,
           referenceImagePath,
-          referenceImagePaths: body.referenceImagePaths || (referenceImagePath ? [referenceImagePath] : []),
+          referenceImagePaths,
           removeWatermark: true,
-          callbackUrl: body.callbackUrl
+          callbackUrl: input.value.callbackUrl
         });
         if (settings.executorEnabled) {
           this.requestExecutor.enqueue(created.requestId);
@@ -721,11 +725,6 @@ function recordOperation(
 
 function notifyDataChanged() {
   mainWindow?.webContents.send("data:changed");
-}
-
-function normalizeModel(model: string): DoubaoModel | null {
-  if (model === "seedance_2_0_mini" || model === "seedance_2_0_fast") return model;
-  return null;
 }
 
 function isAuthorized(request: IncomingMessage, apiKey: string) {
