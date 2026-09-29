@@ -31,6 +31,7 @@ import {
   type BlockerScanInput,
   type BlockerScanResult
 } from "./page-blockers.js";
+import { waitForReadiness } from "./readiness.js";
 import {
   appSiteHostRegExpSource,
   appTypeLabel,
@@ -961,13 +962,23 @@ async function findComposerTarget(win: BrowserWindow) {
  * 单次查询会把“还没渲染”误判成“没有输入框”。
  */
 async function waitForComposerTarget(win: BrowserWindow, timeoutMs = COMPOSER_WAIT_MS) {
-  const startedAt = Date.now();
-  let target = await findComposerTarget(win);
-  while (!target && Date.now() - startedAt < timeoutMs) {
-    await wait(300);
-    target = await findComposerTarget(win);
+  // 结果放在对象里：闭包内赋值无法被 TS 的控制流分析追踪，直接 let 会被收窄成 null。
+  const holder: { target: Awaited<ReturnType<typeof findComposerTarget>> } = { target: null };
+  try {
+    await waitForReadiness({
+      stage: "composer",
+      probe: async () => {
+        holder.target = await findComposerTarget(win);
+        return Boolean(holder.target);
+      },
+      // 输入框只要出现一次就算就绪，不需要多次稳定采样。
+      stableSamples: 1,
+      timeoutMs
+    });
+  } catch {
+    // 超时后返回最后一次查询结果（可能为 null），保持既有调用方的处理语义。
   }
-  return target;
+  return holder.target;
 }
 
 /**
@@ -1045,11 +1056,21 @@ async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
 async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   const target = model === "seedance_2_0_mini" ? "Mini" : "Fast";
   await clickByKeywords(win, ["视频生成"]);
-  await wait(800);
+  // 创作栏是 SPA 异步挂载的，固定 sleep 在慢机器上会把「还没渲染」当成「没有控件」。
+  // 这里改用有界等待；超时不抛错，仍按原路径点击，保持既有的“点击尽力而为”语义。
+  await waitForReadiness({
+    stage: "video_model_control",
+    probe: () => hasVisibleKeyword(win, ["Seedance", "模型", "model"]),
+    timeoutMs: 8000
+  }).catch(() => undefined);
   await clickByKeywords(win, ["Seedance", "模型", "model"]);
-  await wait(500);
+  await waitForReadiness({
+    stage: "video_model_option",
+    probe: () => hasVisibleKeyword(win, [target]),
+    timeoutMs: 8000
+  }).catch(() => undefined);
   await clickByKeywords(win, [target, model === "seedance_2_0_mini" ? "mini" : "fast"]);
-  await wait(500);
+  await wait(300);
 }
 
 /**
@@ -2675,6 +2696,33 @@ async function clickByKeywords(win: BrowserWindow, keywords: string[]) {
       target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
       target.click();
       return true;
+    })()
+  `);
+}
+
+/** 只读探针：页面上是否存在文本命中任一关键词的可见控件。用于就绪门禁，不产生副作用。 */
+async function hasVisibleKeyword(win: BrowserWindow, keywords: string[]): Promise<boolean> {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const keywords = ${JSON.stringify(keywords.map((item) => item.toLowerCase()))};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const textOf = (el) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("placeholder")
+      ].filter(Boolean).join(" ").trim();
+      return Array.from(document.querySelectorAll('button, [role="button"], a, label, div[tabindex], span[tabindex]'))
+        .filter((el) => visible(el))
+        .some((el) => {
+          const text = textOf(el).toLowerCase();
+          return keywords.some((keyword) => text.includes(keyword));
+        });
     })()
   `);
 }
