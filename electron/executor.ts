@@ -301,7 +301,8 @@ export class DoubaoExecutor {
       this.onDataChanged();
     } finally {
       this.activeWindows.delete(requestId);
-      if (win && !win.isDestroyed()) win.close();
+      // 调试显示窗口时保留窗口，便于查看恢复流程中的页面状态。
+      if (win && !win.isDestroyed() && !settings.showExecutorWindow) win.close();
     }
   }
 
@@ -507,7 +508,9 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
 
-      if (settings.autoCloseExecutorWindow) {
+      // 调试时显示窗口的优先级高于自动关闭：勾选后无论是否开启“完成后自动关闭”，
+      // 都保留窗口供排查，避免成功瞬间窗口被关掉。
+      if (settings.autoCloseExecutorWindow && !settings.showExecutorWindow) {
         win.close();
       }
     } catch (error) {
@@ -1776,7 +1779,12 @@ async function captureExecutionDiagnostics(win: BrowserWindow | null | undefined
       })()
     `).catch(() => "");
     await fs.writeFile(path.join(dir, "page-text.txt"), pageText, "utf8");
+    // Windows 上隐藏窗口的 capturePage 会返回空白图；截图前临时显示，拍完恢复。
+    const wasHidden = !win.isVisible();
+    if (wasHidden) win.showInactive();
+    await wait(300);
     const image = await win.webContents.capturePage();
+    if (wasHidden) win.hide();
     await fs.writeFile(path.join(dir, "screenshot.png"), image.toPNG());
     return dir;
   } catch {
@@ -2323,6 +2331,16 @@ async function tryCopyShareLink(win: BrowserWindow) {
   return clipboardMutex.runExclusive(async () => {
     if (win.isDestroyed()) return { shareUrl: null, reason: "执行窗口已关闭" } satisfies ShareCopyResult;
 
+    // 页面的 navigator.clipboard.writeText 要求 document.hasFocus()；
+    // 隐藏窗口的页面没有焦点，豆包的复制会静默失败（剪贴板拿不到链接）。
+    // 复制期间临时以非激活方式显示窗口并聚焦页面，结束后恢复隐藏。
+    const wasHidden = !win.isVisible();
+    if (wasHidden) {
+      win.showInactive();
+      win.webContents.focus();
+      await wait(400);
+    }
+
     const before = clipboard.readText();
     const clipboardSentinel = `__doubao_share_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
     clipboard.writeText(clipboardSentinel);
@@ -2427,6 +2445,7 @@ async function tryCopyShareLink(win: BrowserWindow) {
       return result;
     } finally {
       if (!result.shareUrl) restoreClipboardAfterFailedShare(before, clipboardSentinel);
+      if (wasHidden && !win.isDestroyed()) win.hide();
     }
   });
 }
@@ -2685,18 +2704,15 @@ async function openShareSelection(win: BrowserWindow) {
   if (menuPoint) {
     await sendMouseClick(win, menuPoint.x, menuPoint.y);
     // 新版豆包头部“更多”菜单里直接是“复制分享链接”，点击后就把 /thread/ 链接写进剪贴板，
-    // 不会弹出分享面板。优先精确匹配这个文案，再回退到旧的“分享”子菜单路径。
-    const menuSharePoint = await waitForTextControlPoint(
-      win,
-      ["复制分享链接", "分享"],
-      ["分享图片"],
-      1800
-    );
+    // 不会弹出分享面板。先精确找这个文案，找不到再回退到旧的“分享”子菜单路径。
+    const copyLinkPoint = await waitForTextControlPoint(win, ["复制分享链接"], [], 1800);
+    const menuSharePoint = copyLinkPoint
+      ?? await waitForTextControlPoint(win, ["分享"], ["分享图片"], 1800);
     if (menuSharePoint) {
       await sendMouseClick(win, menuSharePoint.x, menuSharePoint.y);
+      // “复制分享链接”不弹面板，直接返回让调用方去剪贴板取链接，避免空等面板超时。
+      if (copyLinkPoint) return false;
       if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
-      // 如果点击的是“复制分享链接”，没有面板也不要直接放弃，让调用方去剪贴板里取链接。
-      if (menuSharePoint.debug.includes("复制分享链接")) return false;
     }
     // A wrong header candidate can open an unrelated popover. Close it before
     // trying the next fallback so the next click is not swallowed.
