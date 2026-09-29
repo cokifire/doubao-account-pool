@@ -32,6 +32,7 @@ import {
   type BlockerScanResult
 } from "./page-blockers.js";
 import { waitForReadiness } from "./readiness.js";
+import { COMPOSER_EDITABLE_SELECTOR, VIDEO_MODEL_CONTROL_SELECTOR } from "./page-selectors.js";
 import {
   appSiteHostRegExpSource,
   appTypeLabel,
@@ -104,7 +105,6 @@ const RECOVERY_VIDEO_PROBE_MS = 6000;
 // 豆包是 SPA，输入框在页面打开/模式切换后可能晚于脚本才挂载。单次 DOM 查询会
 // 把“还没渲染出来”误判成“页面没有输入框”，因此定位输入框一律走有界轮询。
 const COMPOSER_WAIT_MS = 10000;
-const COMPOSER_EDITABLE_SELECTOR = 'textarea, [contenteditable], [role="textbox"], input[type="text"]';
 // 豆包「视频生成参数确认」面板没有确认按钮，只能像普通对话一样回复这个词再发送。
 const GENERATION_CONFIRM_REPLY = "OK";
 // 豆包分享链接是复制时刻的页面快照：视频刚生成完时分享，快照可能不包含视频卡，
@@ -1063,7 +1063,11 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
     probe: () => hasVisibleKeyword(win, ["Seedance", "模型", "model"]),
     timeoutMs: 8000
   }).catch(() => undefined);
-  await clickByKeywords(win, ["Seedance", "模型", "model"]);
+  // 结构属性优先：类名和文案会随版本漂移，data-* 才是稳定的定位依据。
+  // 查不到就回退到既有的文本点击路径，行为完全不变。
+  if (!(await clickBySelector(win, VIDEO_MODEL_CONTROL_SELECTOR))) {
+    await clickByKeywords(win, ["Seedance", "模型", "model"]);
+  }
   await waitForReadiness({
     stage: "video_model_option",
     probe: () => hasVisibleKeyword(win, [target]),
@@ -2695,6 +2699,23 @@ async function clickByKeywords(win: BrowserWindow, keywords: string[]) {
       if (!target) return false;
       target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
       target.click();
+      return true;
+    })()
+  `);
+}
+
+/** 按稳定结构属性点击可见控件；找不到或不可见时返回 false，交给调用方回退。 */
+async function clickBySelector(win: BrowserWindow, selector: string): Promise<boolean> {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      if (rect.width < 4 || rect.height < 4) return false;
+      if (style.visibility === "hidden" || style.display === "none") return false;
+      el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      el.click();
       return true;
     })()
   `);
