@@ -91,6 +91,8 @@ const RECOVERY_VIDEO_PROBE_MS = 6000;
 // 把“还没渲染出来”误判成“页面没有输入框”，因此定位输入框一律走有界轮询。
 const COMPOSER_WAIT_MS = 10000;
 const COMPOSER_EDITABLE_SELECTOR = 'textarea, [contenteditable], [role="textbox"], input[type="text"]';
+// 豆包「视频生成参数确认」面板没有确认按钮，只能像普通对话一样回复这个词再发送。
+const GENERATION_CONFIRM_REPLY = "OK";
 // 豆包分享链接是复制时刻的页面快照：视频刚生成完时分享，快照可能不包含视频卡，
 // 去水印接口将永远解析不到资源。复制后需打开分享页验证渲染结果，缺失则等待后
 // 重新分享（每次分享生成新的快照），直到分享页确认包含视频或尝试次数用尽。
@@ -1025,6 +1027,55 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   await wait(500);
 }
 
+/**
+ * 豆包部分账号/前端版本在发送提示词后会回复一个「视频生成参数确认」面板，
+ * 列出模型、时长、比例、主体、画面、声音、风格等，并说明「确认后我再开始生成视频」。
+ * 这个确认没有按钮，只能像普通对话一样在输入框回复 OK 再发送；不回复的话
+ * 视频根本不会开始生成，后续只会一直空等视频卡片。
+ */
+async function confirmDoubaoGenerationIfNeeded(
+  win: BrowserWindow,
+  baselineText: string,
+  onProgress?: (message: string) => Promise<void> | void
+) {
+  // 只处理「本次提交之后新出现」的确认面板：聊天历史里可能残留历史任务的确认
+  // 文案，不加基线判断会把旧内容误判成当前任务的确认请求。
+  const needsConfirmation = await runPageScript<boolean>(win, `
+    (() => {
+      const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
+      const baseline = ${JSON.stringify(baselineText)};
+      const markers = ["视频生成参数确认", "确认后我再开始生成视频"];
+      return markers.some((marker) => pageText.includes(marker) && !baseline.includes(marker));
+    })()
+  `);
+  if (!needsConfirmation) return false;
+
+  await onProgress?.("检测到视频生成参数确认，正在回复 OK 开始生成");
+
+  // 确认动作就是一条普通对话回复：填进输入框再发送，与手动操作一致。
+  await fillPrompt(win, GENERATION_CONFIRM_REPLY);
+
+  const sendPoint = await findComposerSendButtonPoint(win);
+  if (sendPoint) {
+    await sendMouseClick(win, sendPoint.x, sendPoint.y);
+  } else {
+    await sendKeyboard(win, "Enter");
+  }
+  await wait(1200);
+
+  // 输入框被清空说明 OK 真的发出去了；仍有残留就补一次回车再查一次。
+  if ((await inspectComposer(win, GENERATION_CONFIRM_REPLY)).promptPresent) {
+    await sendKeyboard(win, "Enter");
+    await wait(1200);
+  }
+
+  if ((await inspectComposer(win, GENERATION_CONFIRM_REPLY)).promptPresent) {
+    throw new Error(`回复 ${GENERATION_CONFIRM_REPLY} 后输入框仍有内容，未能确认开始生成`);
+  }
+
+  return true;
+}
+
 async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, prompt: string) {
   const baselineText = await getPageText(win);
   const attempts: Array<{ label: string; run: () => Promise<boolean> }> = [
@@ -1418,6 +1469,7 @@ async function waitForGenerationResult(
   let directVideoUrl: string | null = null;
   let shareFailureReason: string | null = null;
   let historyFallbackAttempted = false;
+  let generationConfirmed = false;
 
   // 提交后窗口可能并未停在本次会话上（停留在列表页/首页，或中途被重定向走），
   // 主循环若直接在当前页轮询会长时间空等，最终只能靠历史兜底去找视频。
@@ -1435,6 +1487,15 @@ async function waitForGenerationResult(
   }
 
   while (Date.now() - startedAt < timeoutMs) {
+    // 豆包部分版本在收到提示词后会异步回复「视频生成参数确认」面板，要求在输入框
+    // 回复 OK 才真正开始生成。面板要等好几秒才出现（提交后立刻查会查不到），
+    // 所以放在主循环里检测；确认文案会留在聊天记录里，因此只回复一次。
+    if (!generationConfirmed) {
+      if (await confirmDoubaoGenerationIfNeeded(win, baselineText, onProgress)) {
+        generationConfirmed = true;
+      }
+    }
+
     const pageState = await inspectGenerationPage(win);
     const newFailureMessage = pageState.failureMessage
       && hasNewTextOccurrence(pageState.pageText, baselineText, pageState.failureMessage)
