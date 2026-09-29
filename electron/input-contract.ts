@@ -8,7 +8,8 @@
  * 这里统一做白名单校验与归一化，非法入参在进入队列之前就被 400 拦下。
  */
 
-import type { DoubaoModel } from "./types.js";
+import type { DoubaoModel, VideoAspectRatio, VideoDuration } from "./types.js";
+import { normalizeVideoAspectRatio, normalizeVideoDuration } from "./video-config.js";
 
 export const VALID_MODELS: readonly DoubaoModel[] = ["seedance_2_0_mini", "seedance_2_0_fast"];
 export const MAX_PROMPT_LENGTH = 4000;
@@ -21,6 +22,9 @@ export interface NormalizedGenerateInput {
   referenceImagePaths: string[];
   callbackUrl: string | null;
   source: string;
+  /** null 表示未指定，执行器不会去动页面上的时长 / 比例控件。 */
+  duration: VideoDuration | null;
+  aspectRatio: VideoAspectRatio | null;
 }
 
 export type GenerateInputResult =
@@ -109,6 +113,15 @@ export function normalizeGenerateInput(
   const callback = normalizeCallbackUrl(raw.callbackUrl);
   if ("error" in callback) return { ok: false, error: callback.error };
 
+  // 时长 / 比例是可选的，但一旦传了就必须是白名单里的值：静默忽略会让调用方
+  // 以为参数生效了，结果拿到的是豆包默认时长。
+  const hasDuration = raw.duration !== undefined && raw.duration !== null && raw.duration !== "";
+  const duration = hasDuration ? normalizeVideoDuration(raw.duration) : null;
+  if (hasDuration && !duration) return { ok: false, error: "unsupported duration" };
+  const hasAspectRatio = raw.aspectRatio !== undefined && raw.aspectRatio !== null && raw.aspectRatio !== "";
+  const aspectRatio = hasAspectRatio ? normalizeVideoAspectRatio(raw.aspectRatio) : null;
+  if (hasAspectRatio && !aspectRatio) return { ok: false, error: "unsupported aspectRatio" };
+
   const referenceImagePaths = normalizeReferenceImagePaths(raw.referenceImagePaths);
   if (referenceImagePaths === null) {
     return { ok: false, error: "referenceImagePaths must be an array or comma separated string" };
@@ -124,7 +137,9 @@ export function normalizeGenerateInput(
       prompt,
       referenceImagePaths,
       callbackUrl: callback.value,
-      source: asString(raw.source).trim().slice(0, MAX_SOURCE_LENGTH)
+      source: asString(raw.source).trim().slice(0, MAX_SOURCE_LENGTH),
+      duration,
+      aspectRatio
     }
   };
 }

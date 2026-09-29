@@ -27,6 +27,7 @@ import {
   DEFAULT_SETTINGS as SETTINGS_CONTRACT_DEFAULT_SETTINGS,
   normalizeSettings
 } from "./settings-contract.js";
+import { normalizeVideoAspectRatio, normalizeVideoDuration } from "./video-config.js";
 
 /** 本地时间 ISO 字符串（含时区偏移，如 2026-08-26T21:30:00.123+08:00），跟随系统时区。 */
 function toLocalIso(date: Date): string {
@@ -532,6 +533,8 @@ export class AppDatabase {
         api_requests.reference_image_paths AS referenceImagePaths,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
+        api_requests.duration AS duration,
+        api_requests.aspect_ratio AS aspectRatio,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
         api_requests.raw_video_url AS rawVideoUrl,
         api_requests.clean_video_url AS cleanVideoUrl,
@@ -563,6 +566,8 @@ export class AppDatabase {
         api_requests.reference_image_paths AS referenceImagePaths,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
+        api_requests.duration AS duration,
+        api_requests.aspect_ratio AS aspectRatio,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
         api_requests.raw_video_url AS rawVideoUrl,
         api_requests.clean_video_url AS cleanVideoUrl,
@@ -592,11 +597,13 @@ export class AppDatabase {
         reference_image_paths,
         remove_watermark,
         callback_url,
+        duration,
+        aspect_ratio,
         created_at,
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
@@ -609,6 +616,8 @@ export class AppDatabase {
       input.referenceImagePaths && input.referenceImagePaths.length ? JSON.stringify(input.referenceImagePaths) : null,
       input.removeWatermark === false ? 0 : 1,
       input.callbackUrl || null,
+      input.duration || null,
+      input.aspectRatio || null,
       timestamp,
       timestamp,
       input.status === "failed" || input.status === "success" || input.status === "stopped" ? timestamp : null
@@ -884,6 +893,8 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "clean_video_url", "TEXT");
     this.addColumnIfMissing("api_requests", "output_video_path", "TEXT");
     this.addColumnIfMissing("api_requests", "finished_at", "TEXT");
+    this.addColumnIfMissing("api_requests", "duration", "TEXT");
+    this.addColumnIfMissing("api_requests", "aspect_ratio", "TEXT");
   }
 
   private cleanInvalidSuccessfulResults() {
@@ -962,7 +973,10 @@ function normalizeApiRequest(row: unknown): ApiRequest {
   return {
     ...request,
     referenceImagePaths,
-    removeWatermark: Boolean(request.removeWatermark)
+    removeWatermark: Boolean(request.removeWatermark),
+    // 持久化归一化：库里被手工改脏的值不能流进执行器。
+    duration: normalizeVideoDuration(request.duration),
+    aspectRatio: normalizeVideoAspectRatio(request.aspectRatio)
   };
 }
 

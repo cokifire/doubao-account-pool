@@ -15,7 +15,34 @@ test('fills defaults for a minimal payload', () => {
     referenceImagePaths: [],
     callbackUrl: null,
     source: '',
+    duration: null,
+    aspectRatio: null,
   })
+})
+
+test('accepts duration and aspect ratio', () => {
+  const result = normalizeGenerateInput({ prompt: 'x', duration: '10s', aspectRatio: '9:16' }, defaults)
+  assert.equal(result.ok, true)
+  assert.equal(result.value.duration, '10s')
+  assert.equal(result.value.aspectRatio, '9:16')
+})
+
+test('accepts numeric duration from json callers', () => {
+  const result = normalizeGenerateInput({ prompt: 'x', duration: 10 }, defaults)
+  assert.equal(result.ok, true)
+  assert.equal(result.value.duration, '10s')
+})
+
+test('rejects an out-of-whitelist duration instead of ignoring it', () => {
+  const result = normalizeGenerateInput({ prompt: 'x', duration: '30s' }, defaults)
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'unsupported duration')
+})
+
+test('rejects an out-of-whitelist aspect ratio', () => {
+  const result = normalizeGenerateInput({ prompt: 'x', aspectRatio: '1:2' }, defaults)
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'unsupported aspectRatio')
 })
 
 test('rejects an empty prompt', () => {

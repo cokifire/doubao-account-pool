@@ -3,6 +3,9 @@ export type AccountRuntimeStatus = "idle" | "busy" | "error" | "login_required";
 /** 账号所属站点：豆包（国内版）或 Dola（海外版）。 */
 export type AccountAppType = "doubao" | "dola";
 export type DoubaoModel = "seedance_2_0_mini" | "seedance_2_0_fast";
+export type VideoDuration =
+  | "4s" | "5s" | "6s" | "7s" | "8s" | "9s" | "10s" | "11s" | "12s" | "13s" | "14s" | "15s";
+export type VideoAspectRatio = "1:1" | "3:4" | "4:3" | "9:16" | "16:9" | "21:9";
 export type ApiRequestStatus = "accepted" | "running" | "success" | "failed" | "stopped";
 export type OperationLogStatus = "info" | "success" | "failed";
 
@@ -98,6 +101,10 @@ export interface ApiRequest {
   referenceImagePaths: string[];
   removeWatermark: boolean;
   callbackUrl: string | null;
+  /** 请求的视频时长；null 表示未指定，沿用豆包默认。 */
+  duration: VideoDuration | null;
+  /** 请求的视频比例；null 表示未指定，沿用豆包默认。 */
+  aspectRatio: VideoAspectRatio | null;
   doubaoThreadUrl: string | null;
   rawVideoUrl: string | null;
   cleanVideoUrl: string | null;
@@ -119,6 +126,8 @@ export interface ApiRequestCreateInput {
   referenceImagePaths?: string[];
   removeWatermark?: boolean;
   callbackUrl?: string | null;
+  duration?: VideoDuration | null;
+  aspectRatio?: VideoAspectRatio | null;
 }
 
 export interface ApiRequestUpdateInput {
@@ -171,4 +180,8 @@ export interface GenerateRequestBody {
   removeWatermark?: boolean;
   callbackUrl?: string | null;
   source?: string;
+  /** 视频时长，如 "10s"；不传则沿用豆包默认。 */
+  duration?: unknown;
+  /** 视频比例，如 "16:9"；不传则沿用豆包默认。 */
+  aspectRatio?: unknown;
 }

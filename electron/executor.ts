@@ -32,7 +32,20 @@ import {
   type BlockerScanResult
 } from "./page-blockers.js";
 import { waitForReadiness } from "./readiness.js";
-import { COMPOSER_EDITABLE_SELECTOR, VIDEO_MODEL_CONTROL_SELECTOR } from "./page-selectors.js";
+import {
+  COMPOSER_EDITABLE_SELECTOR,
+  VIDEO_COMPOSITE_CONTROL_SELECTOR,
+  VIDEO_DURATION_SLIDER_SELECTOR,
+  VIDEO_MODEL_CONTROL_SELECTOR,
+  VIDEO_OVERLAY_OPTION_SELECTOR
+} from "./page-selectors.js";
+import {
+  durationToSliderValue,
+  getVideoCompositeLabel,
+  parseCompositeLabel,
+  sliderValueToDuration,
+  type VideoParameterRequest
+} from "./video-config.js";
 import {
   appSiteHostRegExpSource,
   appTypeLabel,
@@ -354,6 +367,21 @@ export class DoubaoExecutor {
           `${siteLabel}页面出现${describeBlocker(modeBlocker.code)}拦截，未提交提示词（${modeBlocker.evidence}）`,
           modeBlocker.code
         );
+      }
+
+      // 时长 / 比例是可选参数：只有请求显式指定时才操作页面控件，
+      // 未指定时保持豆包自己的默认值，避免给既有调用方引入额外点击。
+      const videoParameters: VideoParameterRequest = {
+        duration: request.duration,
+        aspectRatio: request.aspectRatio
+      };
+      if (videoParameters.duration || videoParameters.aspectRatio) {
+        await this.updateProgress({
+          requestId,
+          status: "running",
+          message: `正在配置视频生成参数（${describeVideoParameters(videoParameters)}）`
+        });
+        await configureVideoParameters(win, videoParameters);
       }
 
       // 前一次失败的任务可能在输入框/参考图区残留内容，先清理一遍，
@@ -1075,6 +1103,282 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   }).catch(() => undefined);
   await clickByKeywords(win, [target, model === "seedance_2_0_mini" ? "mini" : "fast"]);
   await wait(300);
+}
+
+/** 坐标形如 "x,y"；按页面内命中元素派发完整指针/鼠标序列，只触发用户看得见的控件。 */
+async function clickPagePoint(win: BrowserWindow, position: string): Promise<boolean> {
+  const [x, y] = position.split(",").map(Number);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+  return runPageScript<boolean>(win, `
+    (() => {
+      const x = ${x};
+      const y = ${y};
+      const target = document.elementFromPoint(x, y);
+      if (!target) return false;
+      const rect = target.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+      try {
+        target.dispatchEvent(new PointerEvent("pointerdown", Object.assign({ pointerId: 1, pointerType: "mouse", isPrimary: true }, opts)));
+      } catch (_) {}
+      target.dispatchEvent(new MouseEvent("mousedown", opts));
+      try {
+        target.dispatchEvent(new PointerEvent("pointerup", Object.assign({ pointerId: 1, pointerType: "mouse", isPrimary: true }, opts)));
+      } catch (_) {}
+      target.dispatchEvent(new MouseEvent("mouseup", opts));
+      target.dispatchEvent(new MouseEvent("click", opts));
+      return true;
+    })()
+  `);
+}
+
+/** 创作栏「比例 · 时长」组合控件的当前回显，权威选择器优先、文本回退。 */
+async function readCompositeLabel(win: BrowserWindow): Promise<string | null> {
+  return runPageScript<string | null>(win, `
+    (() => {
+      const labelOf = (el) => {
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        if (rect.width <= 20 || rect.height <= 20) return null;
+        if (style.visibility === "hidden" || style.display === "none") return null;
+        const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
+        return /^(?:自动|[0-9]+:[0-9]+)\\s*·\\s*[0-9]+s$/.test(text) ? text : null;
+      };
+      const authoritative = document.querySelector(${JSON.stringify(VIDEO_COMPOSITE_CONTROL_SELECTOR)});
+      const authoritativeLabel = labelOf(authoritative);
+      if (authoritativeLabel) return authoritativeLabel;
+      // 回退：只认页面下半屏的创作栏区域，避免命中聊天区里长得像比例的文案。
+      const candidates = Array.from(document.querySelectorAll('button[aria-haspopup],button,[role="button"],div'))
+        .filter((el) => el.getBoundingClientRect().top > window.innerHeight * 0.5);
+      candidates.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+      for (const el of candidates) {
+        const value = labelOf(el);
+        if (value) return value;
+      }
+      return null;
+    })()
+  `);
+}
+
+/** 组合控件触发器的中心坐标：点它会打开「比例 / 时长」面板。 */
+async function findCompositeTriggerPoint(win: BrowserWindow): Promise<string | null> {
+  return runPageScript<string | null>(win, `
+    (() => {
+      const usable = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 20 && rect.height > 20 && rect.bottom <= window.innerHeight + 1
+          && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const center = (el) => {
+        const rect = el.getBoundingClientRect();
+        return Math.round(rect.left + rect.width / 2) + "," + Math.round(rect.top + rect.height / 2);
+      };
+      const authoritative = document.querySelector(${JSON.stringify(VIDEO_COMPOSITE_CONTROL_SELECTOR)});
+      if (usable(authoritative)) return center(authoritative);
+      const candidates = Array.from(document.querySelectorAll('button[aria-haspopup],button,[role="button"],div'))
+        .filter((el) => {
+          if (!usable(el)) return false;
+          if (el.getBoundingClientRect().top <= window.innerHeight * 0.5) return false;
+          const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
+          return /^(?:自动|[0-9]+:[0-9]+)\\s*·\\s*[0-9]+s$/.test(text);
+        });
+      candidates.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+      return candidates[0] ? center(candidates[0]) : null;
+    })()
+  `);
+}
+
+/**
+ * 弹层里文本精确等于 expected 的「最内层可见节点」中心坐标。
+ * 新版比例面板的选项不是扁平 button，文字常嵌在多层 div/span 里，
+ * 必须挑最内层、面积最小的那个，否则会点到外层容器上没反应。
+ */
+async function findExactOptionPoint(win: BrowserWindow, expected: string): Promise<string | null> {
+  return runPageScript<string | null>(win, `
+    (() => {
+      const expected = ${JSON.stringify(expected)};
+      const normalize = (el) => (el.innerText || "").replace(/\\s+/g, " ").trim();
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 8 && rect.height > 8 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const leaves = Array.from(document.querySelectorAll(${JSON.stringify(VIDEO_OVERLAY_OPTION_SELECTOR)}))
+        .filter((el) => visible(el) && normalize(el) === expected)
+        .filter((el) => !Array.from(el.children).some((child) => normalize(child) === expected));
+      if (!leaves.length) return null;
+      leaves.sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        return ra.width * ra.height - rb.width * rb.height;
+      });
+      const rect = leaves[0].getBoundingClientRect();
+      return Math.round(rect.left + rect.width / 2) + "," + Math.round(rect.top + rect.height / 2);
+    })()
+  `);
+}
+
+/** 时长滑杆（aria-valuemin=0 / aria-valuemax=11）的中心坐标，并让它获得焦点。 */
+async function findDurationSliderPoint(win: BrowserWindow): Promise<string | null> {
+  return runPageScript<string | null>(win, `
+    (() => {
+      const el = Array.from(document.querySelectorAll(${JSON.stringify(VIDEO_DURATION_SLIDER_SELECTOR)}))
+        .find((node) => {
+          const rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+      if (!el) return null;
+      if (typeof el.focus === "function") el.focus();
+      const rect = el.getBoundingClientRect();
+      return Math.round(rect.left + rect.width / 2) + "," + Math.round(rect.top + rect.height / 2);
+    })()
+  `);
+}
+
+/** 读回滑杆当前值，用于校验「点了不算成功」。 */
+async function readDurationSliderValue(win: BrowserWindow): Promise<number | null> {
+  return runPageScript<number | null>(win, `
+    (() => {
+      const el = Array.from(document.querySelectorAll(${JSON.stringify(VIDEO_DURATION_SLIDER_SELECTOR)}))
+        .find((node) => node.getBoundingClientRect().width > 0);
+      if (!el) return null;
+      const value = Number(el.getAttribute("aria-valuenow"));
+      return Number.isFinite(value) ? value : null;
+    })()
+  `);
+}
+
+async function waitForExactOptionPoint(win: BrowserWindow, expected: string): Promise<string | null> {
+  const holder: { point: string | null } = { point: null };
+  try {
+    await waitForReadiness({
+      stage: "video_option",
+      probe: async () => {
+        holder.point = await findExactOptionPoint(win, expected);
+        return Boolean(holder.point);
+      },
+      stableSamples: 1,
+      timeoutMs: 10_000
+    });
+  } catch {
+    // 超时后返回最后一次查询结果（可能为 null），由调用方决定报错口径。
+  }
+  return holder.point;
+}
+
+/**
+ * 配置视频生成的比例与时长。
+ *
+ * 移植自 doubao-studio 的 `configureVideoOptionsV2`，遵守三条硬约束：
+ * 1. 只点击用户已经看得见的页面控件，绝不改写请求绕过会员门槛；
+ * 2. 每次点击后必须回读页面状态确认，「点了就算成功」一律视为失败；
+ * 3. 任何会员 / 登录拦截立即 fail-closed，不再继续操作。
+ *
+ * 只有调用方显式传入的参数才会被配置；未指定的部分保持豆包自己的默认值。
+ */
+async function configureVideoParameters(win: BrowserWindow, request: VideoParameterRequest): Promise<void> {
+  const { duration, aspectRatio } = request;
+
+  const guardBlocker = async (stage: string) => {
+    const blocker = await inspectPageBlockers(win);
+    if (blocker.blocked) {
+      throw new DoubaoPageFailureError(
+        `配置视频${stage}时出现${describeBlocker(blocker.code)}拦截（${blocker.evidence}）`,
+        blocker.code
+      );
+    }
+  };
+
+  const openCompositePanel = async () => {
+    const position = await findCompositeTriggerPoint(win);
+    if (!position || !(await clickPagePoint(win, position))) {
+      throw new Error("未找到视频「比例 · 时长」组合控件，无法配置生成参数");
+    }
+    await wait(350);
+  };
+
+  // 组合控件是 SPA 异步挂载的，必须等它真正可读才开始操作。
+  await waitForReadiness({
+    stage: "video_composite_control",
+    probe: async () => Boolean(await readCompositeLabel(win)),
+    timeoutMs: 10_000
+  }).catch(() => undefined);
+
+  if (aspectRatio) {
+    const current = parseCompositeLabel(await readCompositeLabel(win));
+    // 比例已经正确时绝不重开面板：再次点击组合触发器等价于把弹层关掉，
+    // 会把「弹层已关闭」误报成「时长控件不可见」。
+    if (current?.aspectRatio !== aspectRatio) {
+      await openCompositePanel();
+      await guardBlocker("比例");
+      const point = await waitForExactOptionPoint(win, aspectRatio);
+      if (!point || !(await clickPagePoint(win, point))) {
+        throw new Error(`未找到视频比例选项 ${aspectRatio}`);
+      }
+      await wait(250);
+      const applied = parseCompositeLabel(await readCompositeLabel(win));
+      if (applied?.aspectRatio !== aspectRatio) {
+        throw new Error(`视频比例回读失败：期望 ${aspectRatio}，页面为 ${applied?.aspectRatio ?? "未知"}`);
+      }
+    }
+  }
+
+  if (duration) {
+    const expectedSliderValue = durationToSliderValue(duration);
+    const current = parseCompositeLabel(await readCompositeLabel(win));
+    // 切换比例后豆包会保留当前时长，可能已经就是目标值。
+    if (current?.duration !== duration) {
+      let sliderPoint = await findDurationSliderPoint(win);
+      if (!sliderPoint) {
+        await openCompositePanel();
+        sliderPoint = await findDurationSliderPoint(win);
+      }
+      if (!sliderPoint) {
+        throw new Error("未找到视频时长滑杆，无法配置生成时长");
+      }
+      await clickPagePoint(win, sliderPoint);
+      await wait(120);
+      // 滑杆用真实键盘事件驱动：Home 回到最小值（4s），每次 → 加 1 秒。
+      await sendKeyboard(win, "Home", [], 120);
+      for (let index = 0; index < expectedSliderValue; index += 1) {
+        await sendKeyboard(win, "Right", [], 60);
+      }
+      await wait(250);
+      await guardBlocker("时长");
+
+      const sliderValue = await readDurationSliderValue(win);
+      const applied = parseCompositeLabel(await readCompositeLabel(win));
+      const appliedSeconds = sliderValue === null ? null : sliderValueToDuration(sliderValue);
+      if (sliderValue !== expectedSliderValue && applied?.duration !== duration && appliedSeconds !== duration) {
+        throw new Error(
+          `视频时长回读失败：期望 ${duration}（滑杆值 ${expectedSliderValue}），页面为 ${
+            applied?.duration ?? (sliderValue === null ? "未知" : `滑杆值 ${sliderValue}`)
+          }`
+        );
+      }
+    }
+  }
+
+  // 最终稳定回读：两项都必须在页面上呈现为目标值，否则不进入提交阶段。
+  const finalLabel = await readCompositeLabel(win);
+  const parsed = parseCompositeLabel(finalLabel);
+  if (aspectRatio && parsed?.aspectRatio !== aspectRatio) {
+    throw new Error(`视频比例最终回读失败：期望 ${aspectRatio}，页面为 ${parsed?.aspectRatio ?? finalLabel ?? "未知"}`);
+  }
+  if (duration && parsed?.duration !== duration) {
+    throw new Error(`视频时长最终回读失败：期望 ${duration}，页面为 ${parsed?.duration ?? finalLabel ?? "未知"}`);
+  }
+}
+
+/** 供日志与排障使用的可读参数描述。 */
+export function describeVideoParameters(request: VideoParameterRequest): string {
+  const parts: string[] = [];
+  if (request.aspectRatio) parts.push(`比例 ${request.aspectRatio}`);
+  if (request.duration) parts.push(`时长 ${request.duration}`);
+  return parts.length ? parts.join("，") : "未指定";
 }
 
 /**

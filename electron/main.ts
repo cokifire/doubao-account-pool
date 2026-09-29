@@ -217,7 +217,9 @@ class LocalApiServer {
             referenceImagePath,
             referenceImagePaths,
             removeWatermark: true,
-            callbackUrl: input.value.callbackUrl
+            callbackUrl: input.value.callbackUrl,
+            duration: input.value.duration,
+            aspectRatio: input.value.aspectRatio
           });
           this.database.appendOperationLog({
             requestId,
@@ -245,7 +247,9 @@ class LocalApiServer {
           referenceImagePath,
           referenceImagePaths,
           removeWatermark: true,
-          callbackUrl: input.value.callbackUrl
+          callbackUrl: input.value.callbackUrl,
+          duration: input.value.duration,
+          aspectRatio: input.value.aspectRatio
         });
         if (settings.executorEnabled) {
           this.requestExecutor.enqueue(created.requestId);
@@ -812,7 +816,9 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
     referenceImageUrl: fields.referenceImageUrl || null,
     removeWatermark: parseOptionalBoolean(fields.removeWatermark),
     callbackUrl: fields.callbackUrl || null,
-    source: fields.source || "multipart-api"
+    source: fields.source || "multipart-api",
+    duration: fields.duration,
+    aspectRatio: fields.aspectRatio
   };
 }
 
