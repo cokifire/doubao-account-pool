@@ -23,6 +23,10 @@ import {
   buildAccountPartition,
   normalizeAppType
 } from "./app-site.js";
+import {
+  DEFAULT_SETTINGS as SETTINGS_CONTRACT_DEFAULT_SETTINGS,
+  normalizeSettings
+} from "./settings-contract.js";
 
 /** 本地时间 ISO 字符串（含时区偏移，如 2026-08-26T21:30:00.123+08:00），跟随系统时区。 */
 function toLocalIso(date: Date): string {
@@ -67,28 +71,8 @@ function parseResetHour(value: string | undefined): number {
 }
 const OPERATION_LOG_RETENTION_DAYS = 3;
 
-const DEFAULT_SETTINGS: AppSettings = {
-  apiServiceEnabled: true,
-  apiPort: 17888,
-  apiKey: "local-doubao-key",
-  executorEnabled: true,
-  showExecutorWindow: false,
-  autoCloseExecutorWindow: true,
-  doubaoChatUrl: "https://www.doubao.com/chat",
-  dolaChatUrl: "https://dola.com/chat",
-  defaultModel: "seedance_2_0_mini",
-  dailyQuotaLimit: 10,
-  miniCost: 2,
-  fastCost: 3,
-  dailyResetTime: "00:00",
-  generationTimeoutSeconds: 900,
-  maxConcurrentAccounts: 4,
-  retryCount: 1,
-  autoRemoveWatermark: true,
-  watermarkApiUrl: "https://nologo.code24.top/api/water-mask/parse",
-  watermarkApiToken: "",
-  outputDir: ""
-};
+// 默认值与归一化规则统一放在 settings-contract.ts，读写两侧共用一份。
+const DEFAULT_SETTINGS = SETTINGS_CONTRACT_DEFAULT_SETTINGS;
 
 export class AppDatabase {
   private readonly db: Database.Database;
@@ -503,27 +487,18 @@ export class AppDatabase {
         data[row.key] = parseSettingValue(row.key, row.value);
       }
     }
-    return data as AppSettings;
+    // 读出即归一化：库里的脏值不会流到执行器和额度计算。
+    return normalizeSettings(data);
   }
 
   updateSettings(input: AppSettingsUpdateInput): AppSettings {
     const current = this.getSettings();
-    const next: AppSettings = {
-      ...current,
-      ...input,
-      apiPort: clampPort(input.apiPort ?? current.apiPort),
-      executorEnabled: Boolean(input.executorEnabled ?? current.executorEnabled),
-      showExecutorWindow: Boolean(input.showExecutorWindow ?? current.showExecutorWindow),
-      autoCloseExecutorWindow: Boolean(input.autoCloseExecutorWindow ?? current.autoCloseExecutorWindow),
-      doubaoChatUrl: String(input.doubaoChatUrl || current.doubaoChatUrl || DEFAULT_SETTINGS.doubaoChatUrl),
-      dolaChatUrl: String(input.dolaChatUrl || current.dolaChatUrl || DEFAULT_SETTINGS.dolaChatUrl),
-      dailyQuotaLimit: clampInt(input.dailyQuotaLimit ?? current.dailyQuotaLimit),
-      miniCost: Math.max(1, clampInt(input.miniCost ?? current.miniCost)),
-      fastCost: Math.max(1, clampInt(input.fastCost ?? current.fastCost)),
-      generationTimeoutSeconds: clampInt(input.generationTimeoutSeconds ?? current.generationTimeoutSeconds),
-      maxConcurrentAccounts: Math.max(1, clampInt(input.maxConcurrentAccounts ?? current.maxConcurrentAccounts)),
-      retryCount: clampInt(input.retryCount ?? current.retryCount)
-    };
+    // 显式 undefined 表示“不改”，因此不能用对象展开直接覆盖。
+    const merged: Record<string, unknown> = { ...current };
+    for (const [key, value] of Object.entries(input)) {
+      if (value !== undefined) merged[key] = value;
+    }
+    const next = normalizeSettings(merged);
 
     const timestamp = now();
     const statement = this.db.prepare(`
@@ -943,12 +918,6 @@ export class AppDatabase {
 function clampInt(value: number) {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.floor(value));
-}
-
-function clampPort(value: number) {
-  const port = clampInt(value);
-  if (port < 1 || port > 65535) return DEFAULT_SETTINGS.apiPort;
-  return port;
 }
 
 function stringifySettingValue(value: unknown) {
