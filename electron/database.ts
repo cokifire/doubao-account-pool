@@ -974,10 +974,19 @@ function normalizeApiRequest(row: unknown): ApiRequest {
     ...request,
     referenceImagePaths,
     removeWatermark: Boolean(request.removeWatermark),
-    // 持久化归一化：库里被手工改脏的值不能流进执行器。
-    duration: normalizeVideoDuration(request.duration),
-    aspectRatio: normalizeVideoAspectRatio(request.aspectRatio)
+    ...normalizeVideoParameters(request.duration, request.aspectRatio)
   };
+}
+
+/**
+ * 持久化归一化：库里被手工改脏的值不能流进执行器。
+ * 时长与比例成对生效，落单的那个一并丢弃，保持「要么都配置、要么都别动」。
+ */
+function normalizeVideoParameters(rawDuration: unknown, rawAspectRatio: unknown) {
+  const duration = normalizeVideoDuration(rawDuration);
+  const aspectRatio = normalizeVideoAspectRatio(rawAspectRatio);
+  if (Boolean(duration) === Boolean(aspectRatio)) return { duration, aspectRatio };
+  return { duration: null, aspectRatio: null };
 }
 
 function normalizeOperationLog(row: unknown): OperationLog {
