@@ -228,6 +228,10 @@ test('detects the Doubao desktop-download prompt that can block sharing', () => 
     true
   )
   assert.equal(
+    isDoubaoDesktopDownloadPrompt('天天领额度 免费用豆包 额度越多 可免费用豆包工作越多 立即下载电脑版'),
+    true
+  )
+  assert.equal(
     isDoubaoDesktopDownloadPrompt('下载电脑版 免费领取'),
     false
   )

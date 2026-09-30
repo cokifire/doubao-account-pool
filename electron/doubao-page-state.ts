@@ -53,9 +53,11 @@ export function isDoubaoDesktopDownloadPrompt(pageText: string) {
   const oldVariant = text.includes("下载电脑版")
     && text.includes("使用完整功能")
     && text.includes("下次提醒我");
-  const newVariant = (text.includes("下载电脑版") || text.includes("下载豆包电脑版"))
+  const subscriptionVariant = (text.includes("下载电脑版") || text.includes("下载豆包电脑版"))
     && text.includes("免费领取 30 天订阅");
-  return oldVariant || newVariant;
+  const quotaVariant = text.includes("天天领额度")
+    && text.includes("下载电脑版");
+  return oldVariant || subscriptionVariant || quotaVariant;
 }
 
 export function isDoubaoGenerationComplete(pageText: string) {
