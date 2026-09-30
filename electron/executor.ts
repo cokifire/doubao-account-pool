@@ -121,11 +121,7 @@ const RECOVERY_VIDEO_PROBE_MS = 6000;
 const COMPOSER_WAIT_MS = 10000;
 // 豆包「视频生成参数确认」面板没有确认按钮，只能像普通对话一样回复这个词再发送。
 const GENERATION_CONFIRM_REPLY = "OK";
-// 豆包分享链接是复制时刻的页面快照：视频刚生成完时分享，快照可能不包含视频卡，
-// 去水印接口将永远解析不到资源。复制后需打开分享页验证渲染结果，缺失则等待后
-// 重新分享（每次分享生成新的快照），直到分享页确认包含视频或尝试次数用尽。
-const SHARE_VERIFY_MAX_ATTEMPTS = 4;
-const SHARE_VERIFY_BACKOFF_MS = [0, 20000, 40000, 80000];
+
 const callbackQueues = new Map<string, Promise<void>>();
 
 export class DoubaoExecutor {
@@ -2133,17 +2129,12 @@ async function waitForGenerationResult(
       }
       directVideoUrl ||= pageState.directVideoUrl;
 
-      // Doubao 的分享链接是复制时刻的页面快照。视频刚生成完时分享，
-      // 快照可能还没有视频卡片，去水印接口将永远找不到资源。复制后
-      // 打开分享页验证渲染结果，缺失则等待后重新分享。
-      const conversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
-      const copied = await copyShareLinkUntilVideoVerified(win, conversationUrl, onProgress);
+      // 拿到分享链接即交付去水印：分享页是否渲染出视频由去水印接口解析结果确认，
+      // 不再先导航到分享页验证（那会离开会话页，还要额外等待与重新分享）。
+      const copied = await tryCopyShareLink(win);
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
         return { shareUrl: copied.shareUrl, directVideoUrl };
-      }
-      if (copied.exhausted) {
-        return { shareUrl: null, directVideoUrl, shareFailureReason: shareFailureReason };
       }
 
       if (Date.now() - generatedAt > 120000) {
@@ -2403,7 +2394,7 @@ async function findGeneratedConversationAndCopyShare(
     generatedMatchCount += 1;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const copied = await copyShareLinkUntilVideoVerified(win, candidate, () => undefined);
+      const copied = await tryCopyShareLink(win);
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
         return {
@@ -2415,7 +2406,6 @@ async function findGeneratedConversationAndCopyShare(
           shareFailureReason: null
         };
       }
-      if (copied.exhausted) break;
       await wait(1000);
     }
   }
@@ -2461,90 +2451,6 @@ async function waitForGeneratedVideoCard(win: BrowserWindow, timeoutMs: number) 
     state = await inspectGenerationPage(win);
   }
   return state;
-}
-
-/**
- * 打开分享链接并等待渲染，确认分享页里真的包含"生成完成"文案与视频卡片。
- * 豆包分享链接是复制时刻的快照：视频未在服务端最终化时复制的链接，分享页
- * 永远没有视频，去水印接口也就永远解析不到资源。成功后窗口停留在分享页。
- */
-async function verifySharePageHasRenderedVideo(win: BrowserWindow, shareUrl: string) {
-  try {
-    await loadUrl(win, shareUrl, 10000);
-    await dismissDoubaoDesktopDownloadPrompt(win);
-    const startedAt = Date.now();
-    let state = await inspectGenerationPage(win);
-    while (Date.now() - startedAt < 20000) {
-      const ready = isGenerationReadyForShare({
-        completionTextPresent: hasNewGenerationCompletion(state.pageText, ""),
-        hasNewVideoSource: state.videoUrls.length > 0,
-        newVideoCount: state.videoUrls.length,
-        newPlayableVideoCount: state.playableVideoCount,
-        newVideoCardCount: state.videoCardCount,
-        completionTextSeenAt: Date.now(),
-        now: Date.now()
-      });
-      if (ready) return true;
-      if (state.failed) return false;
-      await wait(1000);
-      state = await inspectGenerationPage(win);
-    }
-    return false;
-  } catch (error) {
-    console.warn("验证豆包分享页未包含视频", error);
-    return false;
-  }
-}
-
-interface ShareVerifiedResult {
-  shareUrl: string | null;
-  reason: string | null;
-  exhausted: boolean;
-}
-
-/**
- * 复制分享链接并在分享页验证视频卡片，最多尝试 SHARE_VERIFY_MAX_ATTEMPTS 次。
- * 每次分享都会生成新的快照，因此未通过验证时等待退避后重新分享，给豆包留出
- * 视频在服务端最终化的时间。复制失败的瞬态问题返回 exhausted=false，由调用方
- * 的外层循环继续重试；验证耗尽返回 exhausted=true，避免外层循环无限重复。
- */
-async function copyShareLinkUntilVideoVerified(
-  win: BrowserWindow,
-  conversationUrl: string | null,
-  onProgress: (message: string) => Promise<void> | void
-): Promise<ShareVerifiedResult> {
-  let lastReason: string | null = null;
-  for (let attempt = 1; attempt <= SHARE_VERIFY_MAX_ATTEMPTS; attempt += 1) {
-    // 分享验证会导航到分享页；失败后必须回到会话页才能重新打开分享面板。
-    const currentConversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
-    if (conversationUrl && currentConversationUrl !== conversationUrl) {
-      try {
-        await loadUrl(win, conversationUrl, 8000);
-        await dismissDoubaoDesktopDownloadPrompt(win);
-        await waitForGeneratedVideoCard(win, VIDEO_CARD_WAIT_MS);
-      } catch (error) {
-        console.warn("返回豆包会话页失败", error);
-      }
-    }
-
-    const copied = await tryCopyShareLink(win);
-    lastReason = copied.reason;
-    if (!copied.shareUrl) {
-      // 分享面板等瞬态失败由调用方的外层循环继续重试。
-      return { shareUrl: null, reason: lastReason, exhausted: false };
-    }
-
-    if (await verifySharePageHasRenderedVideo(win, copied.shareUrl)) {
-      return { shareUrl: copied.shareUrl, reason: null, exhausted: false };
-    }
-
-    lastReason = `分享页快照未包含视频（第 ${attempt}/${SHARE_VERIFY_MAX_ATTEMPTS} 次）`;
-    if (attempt < SHARE_VERIFY_MAX_ATTEMPTS) {
-      await onProgress(`${lastReason}，${Math.round(SHARE_VERIFY_BACKOFF_MS[attempt] / 1000)} 秒后重新分享`);
-      await wait(SHARE_VERIFY_BACKOFF_MS[attempt]);
-    }
-  }
-  return { shareUrl: null, reason: lastReason, exhausted: true };
 }
 
 /**
@@ -2636,10 +2542,10 @@ async function tryCopyShareLink(win: BrowserWindow) {
 
       await primeGeneratedVideoCard(win);
 
-      // 只做本地格式校验，拿到链接就直接交给去水印流程：
-      // 分享快照里到底有没有视频，由外层 copyShareLinkUntilVideoVerified 打开
-      // 分享页确认（未渲染就退避后重新分享）。这里不再额外请求一次分享页——
-      // 那是纯网络可达性检查，验证不了视频，只会把网络抖动误判成“复制失败”。
+      // 只做本地格式校验，拿到链接就直接交给去水印流程。分享链接是否真能解析出
+      // 视频，由去水印接口的结果确认——它本身就带 0/5/15/30/60 秒重试。
+      // 这里不再请求分享页，也不再导航到分享页验证：那两步都验证不了视频，
+      // 只会把网络抖动或页面渲染慢误判成“复制失败”。
       const acceptCopiedShareUrl = async (shareUrl: string) => {
         if (!isValidDoubaoShareUrl(shareUrl)) {
           result = { shareUrl: null, reason: `复制出的地址不是分享链接：${shareUrl}` };
