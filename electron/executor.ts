@@ -1087,26 +1087,210 @@ async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
 
 async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   const target = model === "seedance_2_0_mini" ? "Mini" : "Fast";
-  await clickByKeywords(win, ["视频生成"]);
-  // 创作栏是 SPA 异步挂载的，固定 sleep 在慢机器上会把「还没渲染」当成「没有控件」。
-  // 这里改用有界等待；超时不抛错，仍按原路径点击，保持既有的“点击尽力而为”语义。
-  await waitForReadiness({
-    stage: "video_model_control",
-    probe: () => hasVisibleKeyword(win, ["Seedance", "模型", "model"]),
-    timeoutMs: 8000
-  }).catch(() => undefined);
+
+  // 创作栏真正挂载才算进入视频生成模式；只看关键词会把它还没渲染误判成已就绪。
+  const compositeReady = async () => Boolean(await findCompositeTriggerPoint(win));
+
+  // 页面内合成的 el.click() 在部分版本上不触发模式切换，优先用原生鼠标事件。
+  const enterVideoMode = async () => {
+    // 「下载豆包工作」这类浮层会盖住创作栏，先把它们关掉再点。
+    await dismissDoubaoDesktopDownloadPrompt(win).catch(() => undefined);
+    if (!(await clickKeywordNatively(win, ["视频生成"]))) {
+      await clickByKeywords(win, ["视频生成"]);
+    }
+  };
+
+  const waitComposite = async (timeoutMs: number) => {
+    try {
+      await waitForReadiness({ stage: "video_composite_control", probe: compositeReady, timeoutMs });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  await enterVideoMode();
+  // 首次点击可能被浮层吞掉或创作栏挂载慢，再补一次点击而不是直接放弃。
+  if (!(await waitComposite(8000))) {
+    await sendKeyboard(win, "ESC", undefined, 250);
+    await enterVideoMode();
+    await waitComposite(8000);
+  }
+
+  if (!(await compositeReady())) {
+    throw new Error("未能进入视频生成模式：创作栏「比例 · 时长」控件未出现");
+  }
+
   // 结构属性优先：类名和文案会随版本漂移，data-* 才是稳定的定位依据。
   // 查不到就回退到既有的文本点击路径，行为完全不变。
-  if (!(await clickBySelector(win, VIDEO_MODEL_CONTROL_SELECTOR))) {
-    await clickByKeywords(win, ["Seedance", "模型", "model"]);
+  if (!(await clickSelectorNatively(win, VIDEO_MODEL_CONTROL_SELECTOR))) {
+    if (!(await clickKeywordNatively(win, ["Seedance", "模型"]))) {
+      await clickByKeywords(win, ["Seedance", "模型", "model"]);
+    }
   }
   await waitForReadiness({
     stage: "video_model_option",
     probe: () => hasVisibleKeyword(win, [target]),
     timeoutMs: 8000
   }).catch(() => undefined);
-  await clickByKeywords(win, [target, model === "seedance_2_0_mini" ? "mini" : "fast"]);
+  if (!(await clickKeywordNatively(win, [target]))) {
+    await clickByKeywords(win, [target, model === "seedance_2_0_mini" ? "mini" : "fast"]);
+  }
   await wait(300);
+}
+
+/** 取选择器命中元素的中心坐标，用于原生鼠标点击。 */
+async function findElementCenter(win: BrowserWindow, selector: string): Promise<{ x: number; y: number } | null> {
+  return runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      if (rect.width < 4 || rect.height < 4) return null;
+      if (style.visibility === "hidden" || style.display === "none") return null;
+      return {
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2)
+      };
+    })()
+  `);
+}
+
+/** 用原生鼠标事件点击选择器命中的元素；比页面内合成 click 更接近真实用户操作。 */
+async function clickSelectorNatively(win: BrowserWindow, selector: string): Promise<boolean> {
+  const point = await findElementCenter(win, selector);
+  if (!point) return false;
+  await sendMouseClick(win, point.x, point.y);
+  return true;
+}
+
+/** 按文案找控件坐标（与 clickByKeywords 同一套评分规则），找不到返回 null。 */
+async function findKeywordPoint(win: BrowserWindow, keywords: string[]): Promise<{ x: number; y: number } | null> {
+  return runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const keywords = ${JSON.stringify(keywords.map((item) => item.toLowerCase()))};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const textOf = (el) => [el.innerText, el.textContent, el.getAttribute("aria-label"), el.getAttribute("title")]
+        .filter(Boolean).join(" ").trim();
+      const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, label, div[tabindex], span[tabindex]'))
+        .filter((el) => visible(el));
+      const scored = nodes
+        .map((el) => {
+          const text = textOf(el).toLowerCase();
+          const score = keywords.reduce((sum, keyword) => sum + (text.includes(keyword) ? 1 : 0), 0);
+          const tagScore = el.tagName === "BUTTON" ? 3 : el.getAttribute("role") === "button" ? 2 : 1;
+          return { el, score, tagScore };
+        })
+        .filter((item) => item.score > 0)
+        .sort((a, b) => b.score - a.score || b.tagScore - a.tagScore);
+      const target = scored[0]?.el;
+      if (!target) return null;
+      const rect = target.getBoundingClientRect();
+      return {
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2)
+      };
+    })()
+  `);
+}
+
+/** 用原生鼠标事件点击文案命中的控件；找不到时返回 false，交给调用方回退。 */
+async function clickKeywordNatively(win: BrowserWindow, keywords: string[]): Promise<boolean> {
+  const point = await findKeywordPoint(win, keywords);
+  if (!point) return false;
+  await sendMouseClick(win, point.x, point.y);
+  return true;
+}
+
+/**
+ * 页面内点击序列：把完整 pointer/mouse 序列直接派发到目标元素本身。
+ * 创作栏控件的中心点常被父容器盖住（elementFromPoint 命中的是外层 DIV），
+ * 走坐标点击会把事件发给容器、控件收不到点击，面板就打不开。
+ */
+const PAGE_CLICK_SEQUENCE = `
+  const dispatchClickSequence = (el) => {
+    const rect = el.getBoundingClientRect();
+    const cx = Math.round(rect.left + rect.width / 2);
+    const cy = Math.round(rect.top + rect.height / 2);
+    const base = { bubbles: true, cancelable: true, view: window, button: 0, clientX: cx, clientY: cy };
+    const seq = [["pointerdown", true], ["mousedown", false], ["pointerup", true], ["mouseup", false], ["click", false]];
+    for (const entry of seq) {
+      const event = entry[1]
+        ? new PointerEvent(entry[0], Object.assign({ pointerId: 1, pointerType: "mouse", isPrimary: true }, base))
+        : new MouseEvent(entry[0], base);
+      el.dispatchEvent(event);
+    }
+  };
+`;
+
+const PAGE_VISIBLE_NODE = `
+  const nodeVisible = (el, minSize) => {
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    const size = minSize || 4;
+    return rect.width > size && rect.height > size
+      && style.visibility !== "hidden" && style.display !== "none";
+  };
+`;
+
+/** 直接点击创作栏「比例 · 时长」组合控件（不经过坐标 hit-test）。 */
+async function clickCompositeControl(win: BrowserWindow): Promise<boolean> {
+  return runPageScript<boolean>(win, `
+    (() => {
+      ${PAGE_CLICK_SEQUENCE}
+      ${PAGE_VISIBLE_NODE}
+      const el = document.querySelector(${JSON.stringify(VIDEO_COMPOSITE_CONTROL_SELECTOR)});
+      if (!el || !nodeVisible(el, 4)) return false;
+      dispatchClickSequence(el);
+      return true;
+    })()
+  `);
+}
+
+/** 直接点击时长滑杆：先让它获得焦点，再派发点击序列。 */
+async function clickDurationSlider(win: BrowserWindow): Promise<boolean> {
+  return runPageScript<boolean>(win, `
+    (() => {
+      ${PAGE_CLICK_SEQUENCE}
+      const el = Array.from(document.querySelectorAll(${JSON.stringify(VIDEO_DURATION_SLIDER_SELECTOR)}))
+        .find((node) => node.getBoundingClientRect().width > 0);
+      if (!el) return false;
+      if (typeof el.focus === "function") el.focus();
+      dispatchClickSequence(el);
+      return true;
+    })()
+  `);
+}
+
+/** 直接点击弹层里文案精确等于 expected 的最内层选项。 */
+async function clickExactOption(win: BrowserWindow, expected: string): Promise<boolean> {
+  return runPageScript<boolean>(win, `
+    (() => {
+      ${PAGE_CLICK_SEQUENCE}
+      ${PAGE_VISIBLE_NODE}
+      const expected = ${JSON.stringify(expected)};
+      const normalize = (el) => {
+        const raw = (el.innerText || "").trim() || (el.textContent || "");
+        return raw.replace(/\\s+/g, " ").trim();
+      };
+      const leaves = Array.from(document.querySelectorAll(${JSON.stringify(VIDEO_OVERLAY_OPTION_SELECTOR)}))
+        .filter((el) => nodeVisible(el, 8) && normalize(el) === expected)
+        .filter((el) => !Array.from(el.children).some((child) => normalize(child) === expected));
+      if (!leaves.length) return false;
+      leaves.sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        return ra.width * ra.height - rb.width * rb.height;
+      });
+      dispatchClickSequence(leaves[0]);
+      return true;
+    })()
+  `);
 }
 
 /** 坐标形如 "x,y"；按页面内命中元素派发完整指针/鼠标序列，只触发用户看得见的控件。 */
@@ -1146,8 +1330,13 @@ async function readCompositeLabel(win: BrowserWindow): Promise<string | null> {
         const style = getComputedStyle(el);
         if (rect.width <= 20 || rect.height <= 20) return null;
         if (style.visibility === "hidden" || style.display === "none") return null;
-        const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
-        return /^(?:自动|[0-9]+:[0-9]+)\\s*·\\s*[0-9]+s$/.test(text) ? text : null;
+        // 创作栏按钮的 innerText 在部分渲染状态下是空字符串（textContent 才有值），
+        // 只看 innerText 会把「已正确配置」误判成「读不到回显」。
+        for (const raw of [el.innerText, el.textContent].filter(Boolean)) {
+          const text = raw.replace(/\\s+/g, " ").trim();
+          if (/^(?:自动|[0-9]+:[0-9]+)\\s*·\\s*[0-9]+s$/.test(text)) return text;
+        }
+        return null;
       };
       const authoritative = document.querySelector(${JSON.stringify(VIDEO_COMPOSITE_CONTROL_SELECTOR)});
       const authoritativeLabel = labelOf(authoritative);
@@ -1186,8 +1375,8 @@ async function findCompositeTriggerPoint(win: BrowserWindow): Promise<string | n
         .filter((el) => {
           if (!usable(el)) return false;
           if (el.getBoundingClientRect().top <= window.innerHeight * 0.5) return false;
-          const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
-          return /^(?:自动|[0-9]+:[0-9]+)\\s*·\\s*[0-9]+s$/.test(text);
+          return [el.innerText, el.textContent].filter(Boolean)
+            .some((raw) => /^(?:自动|[0-9]+:[0-9]+)\\s*·\\s*[0-9]+s$/.test(raw.replace(/\\s+/g, " ").trim()));
         });
       candidates.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
       return candidates[0] ? center(candidates[0]) : null;
@@ -1204,7 +1393,11 @@ async function findExactOptionPoint(win: BrowserWindow, expected: string): Promi
   return runPageScript<string | null>(win, `
     (() => {
       const expected = ${JSON.stringify(expected)};
-      const normalize = (el) => (el.innerText || "").replace(/\\s+/g, " ").trim();
+      // innerText 可能为空（创作栏按钮实测如此），回落到 textContent 再匹配。
+      const normalize = (el) => {
+        const raw = (el.innerText || "").trim() || (el.textContent || "");
+        return raw.replace(/\\s+/g, " ").trim();
+      };
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
@@ -1297,6 +1490,11 @@ async function configureVideoParameters(win: BrowserWindow, request: VideoParame
   };
 
   const openCompositePanel = async () => {
+    // 优先直接派发到控件元素：坐标点击会命中盖住它的父容器，面板就打不开。
+    if (await clickCompositeControl(win)) {
+      await wait(350);
+      return;
+    }
     const position = await findCompositeTriggerPoint(win);
     if (!position || !(await clickPagePoint(win, position))) {
       throw new Error("未找到视频「比例 · 时长」组合控件，无法配置生成参数");
@@ -1319,7 +1517,8 @@ async function configureVideoParameters(win: BrowserWindow, request: VideoParame
       await openCompositePanel();
       await guardBlocker("比例");
       const point = await waitForExactOptionPoint(win, aspectRatio);
-      if (!point || !(await clickPagePoint(win, point))) {
+      // 选项同样优先直接派发；坐标点击在弹层里也常命中容器而不是选项本身。
+      if (!(await clickExactOption(win, aspectRatio)) && (!point || !(await clickPagePoint(win, point)))) {
         throw new Error(`未找到视频比例选项 ${aspectRatio}`);
       }
       await wait(250);
@@ -1343,7 +1542,9 @@ async function configureVideoParameters(win: BrowserWindow, request: VideoParame
       if (!sliderPoint) {
         throw new Error("未找到视频时长滑杆，无法配置生成时长");
       }
-      await clickPagePoint(win, sliderPoint);
+      if (!(await clickDurationSlider(win))) {
+        await clickPagePoint(win, sliderPoint);
+      }
       await wait(120);
       // 滑杆用真实键盘事件驱动：Home 回到最小值（4s），每次 → 加 1 秒。
       await sendKeyboard(win, "Home", [], 120);
