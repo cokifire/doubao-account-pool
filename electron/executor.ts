@@ -1536,7 +1536,7 @@ async function isPromptMovedToChat(win: BrowserWindow, prompt: string) {
 async function sendKeyboard(
   win: BrowserWindow,
   keyCode: string,
-  modifiers?: Array<"control" | "meta">,
+  modifiers?: Array<"control" | "meta" | "shift" | "alt">,
   settleMs = 700
 ) {
   win.webContents.sendInputEvent({ type: "keyDown", keyCode, modifiers });
@@ -2446,6 +2446,15 @@ async function tryCopyShareLink(win: BrowserWindow) {
         }
       };
 
+      // 实测：豆包会话菜单里的“复制分享链接”绑定了 Ctrl+Shift+C。直接按快捷键
+      // 完全不依赖菜单 DOM 定位，是最可靠的路径——按一次就把 /thread/ 链接写进
+      // 剪贴板（每次分享都会生成新的快照链接）。失败再回退到菜单点击。
+      await sendKeyboard(win, "C", ["control", "shift"], 400);
+      const shortcutUrl = await waitForClipboardShareUrl(3200);
+      if (shortcutUrl) {
+        if (await acceptCopiedShareUrl(shortcutUrl)) return result;
+      }
+
       let shareState = await inspectShareSelection(win);
 
       if (!shareState.active) {
@@ -2802,21 +2811,27 @@ async function openShareSelection(win: BrowserWindow) {
     //   复制  →  复制分享链接
     //            复制会话 ID
     // 必须先 hover/click“复制”展开子菜单，才能看到“复制分享链接”。
-    const copySubmenuPoint = await waitForTextControlPoint(
+    const copySubmenuPoint = await waitForMenuItemPoint(
       win,
       ["复制"],
       ["复制分享链接", "复制会话 ID", "复制链接"],
       1800
     );
     if (copySubmenuPoint) {
-      // hover 触发子菜单展开（click 也可，但 hover 与人工行为一致）。
-      await sendMouseMove(win, copySubmenuPoint.x, copySubmenuPoint.y);
-      await wait(250);
-      const copyLinkPoint = await waitForTextControlPoint(win, ["复制分享链接"], [], 1500);
-      if (copyLinkPoint) {
-        await sendMouseClick(win, copyLinkPoint.x, copyLinkPoint.y);
-        // “复制分享链接”直接把 /thread/ 链接写进剪贴板，不会弹出分享面板。
-        return false;
+      // hover 触发子菜单展开；部分版本需要再点一次才展开，因此重试时改用点击。
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (attempt === 0) {
+          await sendMouseMove(win, copySubmenuPoint.x, copySubmenuPoint.y);
+        } else {
+          await sendMouseClick(win, copySubmenuPoint.x, copySubmenuPoint.y);
+        }
+        await wait(350);
+        const copyLinkPoint = await waitForMenuItemPoint(win, ["复制分享链接"], [], 1500);
+        if (copyLinkPoint) {
+          await sendMouseClick(win, copyLinkPoint.x, copyLinkPoint.y);
+          // “复制分享链接”直接把 /thread/ 链接写进剪贴板，不会弹出分享面板。
+          return false;
+        }
       }
     }
     // 兜底：如果菜单结构是旧版或有“分享”入口，走分享面板路径。
@@ -2972,6 +2987,53 @@ async function findTextControlPoint(win: BrowserWindow, keywords: string[], excl
       };
     })()
   `);
+}
+
+/**
+ * 只在菜单项（role=menuitem）里按文案找点。豆包头部“更多”菜单是一棵多级菜单，
+ * 一级的“复制”需要先 hover 才会展开“复制分享链接 / 复制会话 ID”子菜单；
+ * 用通用文本控件查找会命中消息工具栏的“复制”按钮，必须限定在菜单项内。
+ */
+async function findMenuItemPoint(win: BrowserWindow, keywords: string[], excluded: string[] = []) {
+  return runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const keywords = ${JSON.stringify(keywords)};
+      const excluded = ${JSON.stringify(excluded)};
+      const textOf = (el) => [el.innerText, el.textContent, el.getAttribute("aria-label"), el.getAttribute("title")]
+        .filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+      const items = Array.from(document.querySelectorAll('[role="menuitem"]'))
+        .filter((el) => {
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 4 || rect.height < 4) return false;
+          const text = textOf(el);
+          return keywords.some((k) => text.includes(k))
+            && !excluded.some((k) => text.includes(k));
+        })
+        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      const target = items[0];
+      if (!target) return null;
+      const rect = target.getBoundingClientRect();
+      return {
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2)
+      };
+    })()
+  `);
+}
+
+async function waitForMenuItemPoint(
+  win: BrowserWindow,
+  keywords: string[],
+  excluded: string[] = [],
+  timeoutMs = 1800
+) {
+  const startedAt = Date.now();
+  let point = await findMenuItemPoint(win, keywords, excluded);
+  while (!point && Date.now() - startedAt < timeoutMs) {
+    await wait(150);
+    point = await findMenuItemPoint(win, keywords, excluded);
+  }
+  return point;
 }
 
 async function findOverflowMenuPoint(win: BrowserWindow) {
