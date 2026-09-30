@@ -109,7 +109,8 @@ class AsyncMutex {
 // parallel account windows from overwriting each other's sentinel or copied URL.
 const clipboardMutex = new AsyncMutex();
 const SHARE_PANEL_WAIT_MS = 3500;
-const CLIPBOARD_WAIT_MS = 2800;
+// 豆包生成分享快照可能带一次网络往返，剪贴板轮询放宽到 6 秒。
+const CLIPBOARD_WAIT_MS = 6000;
 const CALLBACK_TIMEOUT_MS = 5000;
 const VIDEO_CARD_WAIT_MS = 15000;
 // 历史恢复用更短的探针：主流程已超时后才兜底，视频通常已渲染，无需长等；
@@ -2341,19 +2342,71 @@ async function copyShareLinkUntilVideoVerified(
   return { shareUrl: null, reason: lastReason, exhausted: true };
 }
 
+/**
+ * 豆包复制分享链接用的是 navigator.clipboard.writeText，该方法在页面没有焦点时
+ * 会被浏览器拒绝，导致“复制分享链接”点下去但剪贴板始终是旧内容。注入一个回退：
+ * 原生写入失败时改用 execCommand("copy")，它同样写入系统剪贴板且不依赖焦点。
+ */
+async function patchClipboardWrite(win: BrowserWindow) {
+  await runPageScript<boolean>(win, `
+    (() => {
+      if (!navigator.clipboard) return false;
+      if (window.__doubaoClipboardPatched) return true;
+      const original = navigator.clipboard.writeText
+        ? navigator.clipboard.writeText.bind(navigator.clipboard)
+        : null;
+      const fallback = (text) => {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.top = "0";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.focus();
+        area.select();
+        let ok = false;
+        try { ok = document.execCommand("copy"); } catch (error) { ok = false; }
+        area.remove();
+        return ok ? Promise.resolve() : Promise.reject(new Error("clipboard fallback failed"));
+      };
+      try {
+        Object.defineProperty(navigator.clipboard, "writeText", {
+          configurable: true,
+          value: (text) => (original ? original(text).catch(() => fallback(text)) : fallback(text))
+        });
+      } catch (error) {
+        return false;
+      }
+      window.__doubaoClipboardPatched = true;
+      return true;
+    })()
+  `).catch(() => false);
+}
+
 async function tryCopyShareLink(win: BrowserWindow) {
   return clipboardMutex.runExclusive(async () => {
     if (win.isDestroyed()) return { shareUrl: null, reason: "执行窗口已关闭" } satisfies ShareCopyResult;
 
     // 页面的 navigator.clipboard.writeText 要求 document.hasFocus()；
     // 隐藏窗口的页面没有焦点，豆包的复制会静默失败（剪贴板拿不到链接）。
-    // 复制期间临时以非激活方式显示窗口并聚焦页面，结束后恢复隐藏。
+    // 复制期间临时显示窗口并聚焦页面，结束后恢复隐藏。
     const wasHidden = !win.isVisible();
     if (wasHidden) {
       win.showInactive();
       win.webContents.focus();
       await wait(400);
     }
+    // showInactive 只显示不激活，Windows 上页面仍可能拿不到焦点；
+    // 检测到没有焦点时升级为真正激活窗口，保证剪贴板 API 可用。
+    const pageFocused = await runPageScript<boolean>(win, "document.hasFocus()").catch(() => true);
+    if (!pageFocused) {
+      win.show();
+      win.focus();
+      await wait(400);
+    }
+    // 兜底：即使页面始终拿不到焦点，也让写入剪贴板有 execCommand 回退路径。
+    await patchClipboardWrite(win);
 
     const before = clipboard.readText();
     const clipboardSentinel = `__doubao_share_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
