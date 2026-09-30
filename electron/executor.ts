@@ -1660,9 +1660,13 @@ async function findComposerSendButtonPoint(win: BrowserWindow) {
   `);
 }
 
-async function sendMouseClick(win: BrowserWindow, x: number, y: number) {
+async function sendMouseMove(win: BrowserWindow, x: number, y: number) {
   win.webContents.sendInputEvent({ type: "mouseMove", x, y });
   await wait(80);
+}
+
+async function sendMouseClick(win: BrowserWindow, x: number, y: number) {
+  await sendMouseMove(win, x, y);
   win.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
   await wait(80);
   win.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
@@ -2794,15 +2798,31 @@ async function openShareSelection(win: BrowserWindow) {
   const menuPoint = await findOverflowMenuPoint(win);
   if (menuPoint) {
     await sendMouseClick(win, menuPoint.x, menuPoint.y);
-    // 新版豆包头部“更多”菜单里直接是“复制分享链接”，点击后就把 /thread/ 链接写进剪贴板，
-    // 不会弹出分享面板。先精确找这个文案，找不到再回退到旧的“分享”子菜单路径。
-    const copyLinkPoint = await waitForTextControlPoint(win, ["复制分享链接"], [], 1800);
-    const menuSharePoint = copyLinkPoint
-      ?? await waitForTextControlPoint(win, ["分享"], ["分享图片"], 1800);
+    // 新版豆包头部“更多”菜单的结构是：
+    //   复制  →  复制分享链接
+    //            复制会话 ID
+    // 必须先 hover/click“复制”展开子菜单，才能看到“复制分享链接”。
+    const copySubmenuPoint = await waitForTextControlPoint(
+      win,
+      ["复制"],
+      ["复制分享链接", "复制会话 ID", "复制链接"],
+      1800
+    );
+    if (copySubmenuPoint) {
+      // hover 触发子菜单展开（click 也可，但 hover 与人工行为一致）。
+      await sendMouseMove(win, copySubmenuPoint.x, copySubmenuPoint.y);
+      await wait(250);
+      const copyLinkPoint = await waitForTextControlPoint(win, ["复制分享链接"], [], 1500);
+      if (copyLinkPoint) {
+        await sendMouseClick(win, copyLinkPoint.x, copyLinkPoint.y);
+        // “复制分享链接”直接把 /thread/ 链接写进剪贴板，不会弹出分享面板。
+        return false;
+      }
+    }
+    // 兜底：如果菜单结构是旧版或有“分享”入口，走分享面板路径。
+    const menuSharePoint = await waitForTextControlPoint(win, ["分享"], ["分享图片"], 1800);
     if (menuSharePoint) {
       await sendMouseClick(win, menuSharePoint.x, menuSharePoint.y);
-      // “复制分享链接”不弹面板，直接返回让调用方去剪贴板取链接，避免空等面板超时。
-      if (copyLinkPoint) return false;
       if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
     }
     // A wrong header candidate can open an unrelated popover. Close it before
