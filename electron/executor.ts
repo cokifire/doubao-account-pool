@@ -2464,6 +2464,57 @@ async function tryCopyShareLink(win: BrowserWindow) {
   });
 }
 
+/**
+ * 豆包桌面版下载弹窗的文案会不定期更换（使用完整功能 / 免费领取 30 天订阅 /
+ * 天天领额度……），逐个补文案规则永远是打地鼠。这些弹窗真正稳定不变的共同点是：
+ * 它是一个浮层容器，里面有一个文字含“下载”的按钮，且整体文案提到“电脑版”。
+ * 按这个特征判定，以后新增文案变体不必再改规则。
+ *
+ * 注意不能退化成“全页文本里出现下载电脑版”：侧边栏入口和会话流里的推广位也会
+ * 出现这个词，正常页面会被误判成弹窗（实测 6 个账号页面里 4 个有该词且无弹窗）。
+ */
+const DOUBAO_DESKTOP_PROMPT_HELPERS = `
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 4
+      && rect.height > 4
+      && style.visibility !== "hidden"
+      && style.display !== "none"
+      && style.pointerEvents !== "none";
+  };
+  const textOf = (el) => [
+    el.innerText,
+    el.textContent,
+    el.getAttribute("aria-label"),
+    el.getAttribute("title")
+  ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+  const findDesktopDownloadModal = () => {
+    let containers = [];
+    try {
+      containers = Array.from(document.querySelectorAll(
+        '[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog, ' +
+        '[class*="modal" i], [class*="dialog" i], [class*="overlay" i], ' +
+        '[class*="mask" i], [class*="popup" i]'
+      ));
+    } catch {
+      // 容器选择器不被支持时不能让整个关闭流程抛异常，降级到纯函数文案判定。
+      return null;
+    }
+    return containers
+      .filter(visible)
+      .find((container) => {
+        const containerText = ((container.innerText || "") + " " + (container.textContent || ""))
+          .replace(/\\s+/g, " ");
+        // 要求文案提到“电脑版”，把“下载视频”这类无关弹窗排除掉。
+        if (!/电脑版/.test(containerText)) return false;
+        return Array.from(container.querySelectorAll('button, [role="button"], a, [tabindex]'))
+          .filter(visible)
+          .some((el) => /下载/.test(textOf(el)));
+      }) || null;
+  };
+`;
+
 async function dismissDoubaoDesktopDownloadPrompt(win: BrowserWindow) {
   if (win.isDestroyed()) return false;
 
@@ -2472,28 +2523,18 @@ async function dismissDoubaoDesktopDownloadPrompt(win: BrowserWindow) {
     action: "remind_later" | "close" | null;
   }>(win, `
     (() => {
+      ${DOUBAO_DESKTOP_PROMPT_HELPERS}
       const isDoubaoDesktopDownloadPrompt = ${isDoubaoDesktopDownloadPrompt.toString()};
       const pageText = document.body?.innerText || "";
-      if (!isDoubaoDesktopDownloadPrompt(pageText)) {
+      const modal = findDesktopDownloadModal();
+      // 浮层特征是通用判定；纯函数按已知文案兜底，覆盖容器结构变化的情况。
+      if (!modal && !isDoubaoDesktopDownloadPrompt(pageText)) {
         return { detected: false, action: null };
       }
 
-      const visible = (el) => {
-        const rect = el.getBoundingClientRect();
-        const style = getComputedStyle(el);
-        return rect.width > 4
-          && rect.height > 4
-          && style.visibility !== "hidden"
-          && style.display !== "none"
-          && style.pointerEvents !== "none";
-      };
-      const textOf = (el) => [
-        el.innerText,
-        el.textContent,
-        el.getAttribute("aria-label"),
-        el.getAttribute("title")
-      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
-      const controls = Array.from(document.querySelectorAll('button, [role="button"], a, [tabindex]'))
+      // 关闭按钮只在弹窗容器内找，避免点到页面上其它无关 “×”。
+      const scope = modal || document;
+      const controls = Array.from(scope.querySelectorAll('button, [role="button"], a, [tabindex]'))
         .filter(visible);
       const clickTarget = (el) => el.closest('button, [role="button"], a, [tabindex]') || el;
       const remindLater = controls.find((el) => textOf(el).replace(/\\s+/g, "") === "下次提醒我");
@@ -2531,27 +2572,10 @@ async function dismissDoubaoDesktopDownloadPrompt(win: BrowserWindow) {
   try {
     const stillVisible = await runPageScript<boolean>(win, `
       (() => {
+        ${DOUBAO_DESKTOP_PROMPT_HELPERS}
         const isDoubaoDesktopDownloadPrompt = ${isDoubaoDesktopDownloadPrompt.toString()};
         const pageText = document.body?.innerText || "";
-        if (!isDoubaoDesktopDownloadPrompt(pageText)) return false;
-        const visible = (el) => {
-          const rect = el.getBoundingClientRect();
-          const style = getComputedStyle(el);
-          return rect.width > 4
-            && rect.height > 4
-            && style.visibility !== "hidden"
-            && style.display !== "none"
-            && style.pointerEvents !== "none";
-        };
-        const textOf = (el) => [
-          el.innerText,
-          el.textContent,
-          el.getAttribute("aria-label"),
-          el.getAttribute("title")
-        ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
-        return Array.from(document.querySelectorAll('button, [role="button"], a, [tabindex]'))
-          .filter(visible)
-          .some((el) => textOf(el).replace(/\\s+/g, "") === "下次提醒我");
+        return Boolean(findDesktopDownloadModal()) || isDoubaoDesktopDownloadPrompt(pageText);
       })()
     `);
     if (stillVisible) await sendKeyboard(win, "ESC", undefined, 250);
