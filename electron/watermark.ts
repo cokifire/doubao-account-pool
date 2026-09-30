@@ -16,7 +16,6 @@ const UNSUPPORTED_RE = /平台暂不支持|暂不支持|不支持该平台|unsup
 // longer backoff so eventual-consistency responses are not treated as failures.
 export const WATERMARK_RETRY_DELAYS_MS = [0, 5000, 15000, 30000, 60000] as const;
 const REQUEST_TIMEOUT_MS = 20000;
-const SHARE_PAGE_TIMEOUT_MS = 10000;
 
 export interface WatermarkRetryInfo {
   failedAttempt: number;
@@ -50,36 +49,6 @@ const DOUBAO_SHARE_URL_RE = new RegExp(`^https?://${appSiteHostRegExpSource()}/(
 
 export function isValidDoubaoShareUrl(url: string) {
   return DOUBAO_SHARE_URL_RE.test(url);
-}
-
-export async function verifyDoubaoShareVideoResource(shareUrl: string) {
-  if (!isValidDoubaoShareUrl(shareUrl)) {
-    throw new Error(`复制出的地址不是豆包分享链接：${shareUrl}`);
-  }
-
-  let response: Response;
-  try {
-    response = await fetch(shareUrl, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(SHARE_PAGE_TIMEOUT_MS)
-    });
-  } catch (error) {
-    throw new Error(`复制出的豆包分享页无法访问：${errorMessage(error)}`);
-  }
-
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new Error(`复制出的豆包分享页无法访问：HTTP ${response.status}`);
-  }
-
-  const html = await response.text();
-  // 豆包 thread 分享页是客户端渲染（SPA），视频数据不会出现在初始 HTML 里，
-  // 因此这里只做“页面确实能打开”的轻量检查；分享链接是否真的包含视频，
-  // 由后续去水印接口解析该 thread 链接时的结果来最终确认。
-  if (html.trim().length < 2000) {
-    throw new Error("复制出的豆包分享页没有正常加载内容");
-  }
 }
 
 export async function resolveCleanVideoUrl(

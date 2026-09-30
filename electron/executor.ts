@@ -52,7 +52,7 @@ import {
   chatUrlForAppType
 } from "./app-site.js";
 import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoModel } from "./types.js";
-import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource } from "./watermark.js";
+import { isValidDoubaoShareUrl, resolveCleanVideoUrl } from "./watermark.js";
 
 type DataChangedCallback = () => void;
 type QueueItem = {
@@ -2636,15 +2636,17 @@ async function tryCopyShareLink(win: BrowserWindow) {
 
       await primeGeneratedVideoCard(win);
 
+      // 只做本地格式校验，拿到链接就直接交给去水印流程：
+      // 分享快照里到底有没有视频，由外层 copyShareLinkUntilVideoVerified 打开
+      // 分享页确认（未渲染就退避后重新分享）。这里不再额外请求一次分享页——
+      // 那是纯网络可达性检查，验证不了视频，只会把网络抖动误判成“复制失败”。
       const acceptCopiedShareUrl = async (shareUrl: string) => {
-        try {
-          await verifyDoubaoShareVideoResource(shareUrl);
-          result = { shareUrl, reason: null };
-          return true;
-        } catch (error) {
-          result = { shareUrl: null, reason: errorMessage(error) };
+        if (!isValidDoubaoShareUrl(shareUrl)) {
+          result = { shareUrl: null, reason: `复制出的地址不是分享链接：${shareUrl}` };
           return false;
         }
+        result = { shareUrl, reason: null };
+        return true;
       };
 
       // 实测：豆包会话菜单里的“复制分享链接”绑定了 Ctrl+Shift+C。直接按快捷键
