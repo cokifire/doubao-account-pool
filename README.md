@@ -81,7 +81,7 @@ curl http://127.0.0.1:17888/api/requests/doubao-xxxxxxxxxxxxxxxx \
 }
 ```
 
-完整接口说明见 [docs/API.md](docs/API.md)。
+完整接口说明见 [docs/API.md](docs/API.md)。若要把本服务作为视频 Provider 接进 waoo-video，见其中的「作为 waoo-video 的 Provider 接入」小节。
 
 第一次使用、连接无限画布和排错请先阅读 [新手使用手册](docs/USER_GUIDE.md)。
 

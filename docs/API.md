@@ -101,3 +101,34 @@ Content-Type: application/json
 
 - `cleanVideoUrl` 是经过验证、可访问的 MP4 视频地址。
 - `outputVideoPath` 是已经保存成功的本地 `.mp4` 文件路径。
+
+## 作为 waoo-video 的 Provider 接入
+
+waoo-video（`../waoo-video`）已内置 `doubao-pool` Provider，直接调用本接口，无需任何中间层：提交走 `POST /api/generate`，轮询走 `GET /api/requests/:requestId`，任务 id 封装成 `DOUBAO_POOL:VIDEO:<providerId>:<requestId>`。
+
+在 waoo-video 侧配置 Provider 实例（apiKey 为本接口的 Bearer Token）：
+
+| 环境变量 | 说明 | 默认 |
+| --- | --- | --- |
+| `PLATFORM_DOUBAO_POOL_API_KEY` | 本接口的 API Key | 无，必填 |
+| `PLATFORM_DOUBAO_POOL_BASE_URL` | 本接口地址 | `http://127.0.0.1:17888` |
+
+字段映射：
+
+| waoo-video 入参 | 本接口字段 | 说明 |
+| --- | --- | --- |
+| `modelId: seedance_2_0_mini` / `seedance_2_0_fast` | `model` | 与本地模型 id 同名，无需转换 |
+| `options.prompt` | `prompt` | 超过 4000 字符会被本接口 400 拒绝 |
+| `options.duration`（整数秒） | `duration` | 只接受 4–15 |
+| `options.aspectRatio` | `aspectRatio` | 只接受 `1:1` / `3:4` / `4:3` / `9:16` / `16:9` / `21:9` |
+| `imageUrl`（首帧） | `referenceImageUrl` 或 `referenceImage` 文件 | 公网 URL 直接传给本接口下载；`data:` URL 由 waoo-video 解码后以 multipart 上传 |
+| — | `source` | 固定传 `waoo-video`，便于在本接口的日志里区分来源 |
+
+接入约定：
+
+- **时长与比例成对**：本接口要求两个参数同时出现或同时缺省。waoo-video 的任务信封只带时长，因此 Provider 在只收到一个时用默认值补齐（时长缺省 10 秒，比例缺省 `16:9`），不会丢弃已指定的那一个。
+- **只支持单张参考图**：Provider 只声明 `text_to_video` 与 `first_frame`，不声明多参考图、尾帧、音频与视频参考。
+- **分辨率不可控**：豆包自行决定输出档位，Provider 用单一占位档位计费，不会把分辨率下发到本接口。
+- **没有取消接口**：Provider 不报告 `queued` 阶段，队列超时由 waoo-video 自身的生成超时兜底。
+- **代理**：如果 waoo-video 配置了全局出站代理，`NO_PROXY` 必须包含池子地址，否则 `127.0.0.1` 的回环请求会被代理拦截。
+- **结果**：只有 `status: "success"` 且 `cleanVideoUrl`（或 `outputVideoPath`）非空才算完成；`failed` / `stopped` 都会让 waoo-video 侧任务失败。
