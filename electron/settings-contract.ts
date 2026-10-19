@@ -23,7 +23,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   miniCost: 2,
   fastCost: 3,
   dailyResetTime: "00:00",
-  generationTimeoutSeconds: 900,
+  generationTimeoutSeconds: 1800,
   maxConcurrentAccounts: 4,
   retryCount: 1,
   autoRemoveWatermark: true,

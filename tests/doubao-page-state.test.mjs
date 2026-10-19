@@ -13,12 +13,57 @@ import {
   isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
+  isConversationResultForCurrentTask,
+  isDoubaoConfirmationAwaitingReply,
   isGenerationReadyForShare,
   isLocalDraftDoubaoConversationUrl,
   isPromptMovedOutOfComposer,
   isQuotaNotChargedFailure,
   promptSignature,
 } from '../dist-electron/doubao-page-state.js'
+
+test('rejects videos from conversations that do not belong to the current task', () => {
+  // 记录会话（本次提交会话）天然归属本次任务，即使提示词没命中也可以取它的视频。
+  assert.equal(
+    isConversationResultForCurrentTask({ isRecordedConversation: true, promptMatched: false }),
+    true
+  )
+  // 命中提示词的会话归属本次任务。
+  assert.equal(
+    isConversationResultForCurrentTask({ isRecordedConversation: false, promptMatched: true }),
+    true
+  )
+  // 关键回归：既不归属记录会话、也没命中提示词的旧会话，即便里面有已生成的视频，
+  // 也绝不能把它的分享链接当成本次结果（真机：交付了第二个对话的视频）。
+  assert.equal(
+    isConversationResultForCurrentTask({ isRecordedConversation: false, promptMatched: false }),
+    false
+  )
+})
+
+test('detects a confirmation panel that is still waiting for a reply', () => {
+  // 真机事故样本（debug/doubao-eb507d3a11db4044）：面板就在页面上、后面没有任何回复词，
+  // 程序却从未识别到 —— 旧逻辑用"提交前基线里有没有面板文案"来排除历史面板，
+  // 而执行窗口恢复的上一次会话里正好残留着未回复的面板，于是本次面板被永久忽略。
+  const unanswered = [
+    '生成视频：画面：微观金属基底表面。',
+    '我将生成一条微观金属表面等离子清洗概念视频。',
+    '视频生成参数确认',
+    '模型： Seedance 2.0 Mini',
+    '时长： 10 秒',
+    '确认后我再开始生成视频。',
+    '今天 23:09 对话 视频生成'
+  ].join(' ')
+  assert.equal(isDoubaoConfirmationAwaitingReply(unanswered), true)
+
+  // 已经回复过：OK 作为用户消息紧跟在面板之后，不能再重复回复。
+  const answered = '确认后我再开始生成视频。 OK 我将为你生成一条 10 秒的视频。'
+  assert.equal(isDoubaoConfirmationAwaitingReply(answered), false)
+
+  // 页面上没有面板。
+  assert.equal(isDoubaoConfirmationAwaitingReply('你的视频生成好了。 和豆包继续聊'), false)
+  assert.equal(isDoubaoConfirmationAwaitingReply(''), false)
+})
 
 test('detects Doubao infringement and violation failures', () => {
   const text = '生成内容中疑似包含侵权 / 违规内容，无法返回该内容，换个主题再试试，生成额度未扣除。'

@@ -20,3 +20,6 @@ export const VIDEO_OVERLAY_OPTION_SELECTOR =
 
 /** 输入框候选：页面可能用 textarea、contenteditable 或 role=textbox。 */
 export const COMPOSER_EDITABLE_SELECTOR = 'textarea, [contenteditable], [role="textbox"], input[type="text"]';
+
+/** 创作栏图片/文件上传按钮（2026-10 豆包在视频生成模式下暴露的稳定属性）。 */
+export const UPLOAD_FILE_BUTTON_SELECTOR = '[data-testid="upload_file_button"]';

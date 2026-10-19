@@ -43,6 +43,51 @@ export function containsPromptSignature(value: string, prompt: string) {
   return signature.length > 0 && normalizeComparableText(value).includes(signature);
 }
 
+/**
+ * 判断某个历史会话里的视频能否归属为“本次任务的结果”。
+ *
+ * 历史恢复遍历的是账号“最近对话”列表，里面混着**以前任务的会话**，那些会话里
+ * 也可能有已经生成好的视频。“只要会话里有视频就复制链接”会把上一个任务的旧视频
+ * 当成本次结果提交去水印（真机事故：本次任务因未二次确认而根本没生成，
+ * 却把第二个对话的视频交付了出去）。
+ *
+ * 归属规则（宁可判失败退额度，也不能交付别人的视频）：
+ * - 记录会话（本次提交后记录的会话地址）天然属于本次任务；
+ * - 其余会话必须命中本次提示词，否则一律跳过。
+ */
+export function isConversationResultForCurrentTask(input: {
+  isRecordedConversation: boolean;
+  promptMatched: boolean;
+}) {
+  return input.isRecordedConversation || input.promptMatched;
+}
+
+/**
+ * 判断页面上的「视频生成参数确认」面板是否仍在等待回复。
+ *
+ * 判定只看**面板之后**有没有出现回复词（OK / 确认），
+ * 不能用"提交前的整页基线里有没有面板文案"来排除历史面板：
+ * 执行窗口是按账号入口地址打开的，豆包会恢复**上一次任务的会话**，
+ * 那个会话里可能残留着一个未回复的确认面板 → 基线里带着面板文案 →
+ * 旧写法 `pageText.includes(marker) && !baseline.includes(marker)` 永远为假 →
+ * 本次任务的面板明明就在页面上却一直识别不到，豆包后台也就永远不会开始生成。
+ * （真机事故 doubao-66780b12877c48d0 / doubao-eb507d3a11db4044：面板可见、无 OK 回复。）
+ *
+ * 取面板**最后一次**出现的位置，避免被聊天里更早的历史面板干扰。
+ */
+export function isDoubaoConfirmationAwaitingReply(pageText: string) {
+  const text = pageText.replace(/\s+/g, " ").trim();
+  const markers = ["视频生成参数确认", "确认后我再开始生成视频"];
+  const found = markers
+    .map((marker) => ({ marker, at: text.lastIndexOf(marker) }))
+    .filter((item) => item.at >= 0)
+    .sort((a, b) => b.at - a.at)[0];
+  if (!found) return false;
+  // 回复会作为用户消息紧跟在面板后面（如 "确认后我再开始生成视频。 OK 我将为你生成…"）。
+  const tail = text.slice(found.at + found.marker.length, found.at + found.marker.length + 24);
+  return !/(OK|确认)/.test(tail);
+}
+
 export function isDoubaoPromptRewritePage(pageText: string) {
   const text = pageText.replace(/\s+/g, " ").trim();
   return /完整\s*\d+(?:\.\d+)?\s*秒视频生成指令|可直接用于(?:AI\s*)?视频生成工具|要不要我再精简一版提示词/.test(text);

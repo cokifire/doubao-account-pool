@@ -12,9 +12,11 @@ import {
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
+  isDoubaoConfirmationAwaitingReply,
   isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
+  isConversationResultForCurrentTask,
   isLocalDraftDoubaoConversationUrl,
   isGenerationReadyForShare,
   isPromptMovedOutOfComposer,
@@ -34,6 +36,7 @@ import {
 import { waitForReadiness } from "./readiness.js";
 import {
   COMPOSER_EDITABLE_SELECTOR,
+  UPLOAD_FILE_BUTTON_SELECTOR,
   VIDEO_COMPOSITE_CONTROL_SELECTOR,
   VIDEO_DURATION_SLIDER_SELECTOR,
   VIDEO_MODEL_CONTROL_SELECTOR,
@@ -47,7 +50,6 @@ import {
   type VideoParameterRequest
 } from "./video-config.js";
 import {
-  appSiteHostRegExpSource,
   appTypeLabel,
   chatUrlForAppType
 } from "./app-site.js";
@@ -119,6 +121,9 @@ const RECOVERY_VIDEO_PROBE_MS = 6000;
 // 豆包是 SPA，输入框在页面打开/模式切换后可能晚于脚本才挂载。单次 DOM 查询会
 // 把“还没渲染出来”误判成“页面没有输入框”，因此定位输入框一律走有界轮询。
 const COMPOSER_WAIT_MS = 10000;
+// 点「新对话」后等地址切走的窗口：切不过来也只是回到旧行为，不需要太长。
+const NEW_CONVERSATION_WAIT_MS = 8000;
+
 // 豆包「视频生成参数确认」面板没有确认按钮，只能像普通对话一样回复这个词再发送。
 const GENERATION_CONFIRM_REPLY = "OK";
 
@@ -350,6 +355,16 @@ export class DoubaoExecutor {
         }
         throw new Error(`${siteLabel}账号未登录，已打开登录窗口，请登录后重试`);
       }
+
+      // 先开新对话：入口地址会恢复上一次任务的会话，直接提交会把提示词追加到旧会话里，
+      // 旧会话残留的内容（未回复的确认面板等）还会污染提交前的整页基线。
+      // 必须在切换视频模式之前做——模式是跟着会话走的。
+      await this.updateProgress({
+        requestId,
+        status: "running",
+        message: `正在开启${siteLabel}新对话`
+      });
+      await startNewConversation(win);
 
       await this.updateProgress({
         requestId,
@@ -725,6 +740,18 @@ async function uploadReferenceImage(win: BrowserWindow, imagePaths: string[]) {
     return;
   }
 
+  // 2026-10 豆包视频生成模式的上传入口是一个只有 SVG 图标的圆形加号按钮，
+  // 没有文本，clickByKeywords 无法命中；它带有稳定的 data-testid="upload_file_button"。
+  // 点击后会展开上传菜单（aria-haspopup="menu"），随后页面会出现 file input。
+  if (await clickBySelector(win, UPLOAD_FILE_BUTTON_SELECTOR)) {
+    await wait(1200);
+    if (await setFileInputs(win, resolvedPaths)) {
+      await wait(settleWaitMs);
+      await waitForImageUploads(win, resolvedPaths.length, 25000);
+      return;
+    }
+  }
+
   await clickByKeywords(win, ["上传", "参考图", "图片", "添加图片", "附件", "image", "upload"]);
   await wait(1200);
 
@@ -870,6 +897,47 @@ async function fillPrompt(win: BrowserWindow, prompt: string) {
 
   const diagnostics = await inspectComposer(win, prompt);
   throw new Error(`豆包输入框没有真正接收本次提示词（已尝试 ${tried.join("、")}；${formatComposerDiagnostics(diagnostics)}）`);
+}
+
+/**
+ * 提交前先点侧边栏「新对话」，切到一个空白会话，再交给后续步骤填提示词。
+ *
+ * 执行窗口是按账号**入口地址**打开的，豆包会恢复上一次任务的会话：
+ * - 直接提交会把本次提示词追加到旧会话里，旧会话残留的内容（未回复的
+ *   「视频生成参数确认」面板、上一轮的报错、上一轮的参考图）会混进本次结果；
+ * - 提交前抓的整页基线也会带上旧内容（历史面板污染基线的源头）。
+ *
+ * 这是“能开就开”的清理步骤：确认不了新会话已就绪时**不抛错**，
+ * 调用方继续走原有流程（等价于没有这一步时的行为），避免因为侧边栏
+ * 找不到入口就让整批任务直接失败。
+ */
+async function startNewConversation(win: BrowserWindow) {
+  const beforeUrl = win.webContents.getURL();
+  // 地址里本来就没有会话 id（停在空白新会话）时不用再点。
+  if (!extractDoubaoConversationUrl(beforeUrl)) return;
+
+  // 「下载豆包工作」这类浮层会盖住侧边栏，先关掉再点。
+  await dismissDoubaoDesktopDownloadPrompt(win).catch(() => undefined);
+  if (!(await clickKeywordNatively(win, ["新对话"]))) {
+    await clickByKeywords(win, ["新对话"]);
+  }
+  await wait(1200);
+
+  try {
+    await waitForReadiness({
+      stage: "new_conversation",
+      probe: async () => {
+        // 新会话要么换成新的会话地址，要么回到没有会话 id 的首页；
+        // 同时要求输入框已经重新挂载，避免后续步骤落在还未就绪的页面上。
+        return win.webContents.getURL() !== beforeUrl && Boolean(await findComposerTarget(win));
+      },
+      // 地址只要变一次就算就绪，不需要多次稳定采样。
+      stableSamples: 1,
+      timeoutMs: NEW_CONVERSATION_WAIT_MS
+    });
+  } catch {
+    // 侧边栏没找到入口或地址没变：保持旧行为继续提交。
+  }
 }
 
 /**
@@ -1590,20 +1658,12 @@ export function describeVideoParameters(request: VideoParameterRequest): string 
  */
 async function confirmDoubaoGenerationIfNeeded(
   win: BrowserWindow,
-  baselineText: string,
   onProgress?: (message: string) => Promise<void> | void
 ) {
-  // 只处理「本次提交之后新出现」的确认面板：聊天历史里可能残留历史任务的确认
-  // 文案，不加基线判断会把旧内容误判成当前任务的确认请求。
-  const needsConfirmation = await runPageScript<boolean>(win, `
-    (() => {
-      const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
-      const baseline = ${JSON.stringify(baselineText)};
-      const markers = ["视频生成参数确认", "确认后我再开始生成视频"];
-      return markers.some((marker) => pageText.includes(marker) && !baseline.includes(marker));
-    })()
-  `);
-  if (!needsConfirmation) return false;
+  // 是否还在等回复只看面板自身（面板后面有没有回复词），不看提交前的整页基线：
+  // 执行窗口恢复的上一次会话里可能残留未回复的面板，用基线排除会让本次面板永远识别不到。
+  const pageText = await getPageText(win);
+  if (!isDoubaoConfirmationAwaitingReply(pageText)) return false;
 
   await onProgress?.("检测到视频生成参数确认，正在回复 OK 开始生成");
 
@@ -2055,7 +2115,7 @@ async function waitForGenerationResult(
     // 回复 OK 才真正开始生成。面板要等好几秒才出现（提交后立刻查会查不到），
     // 所以放在主循环里检测；确认文案会留在聊天记录里，因此只回复一次。
     if (!generationConfirmed) {
-      if (await confirmDoubaoGenerationIfNeeded(win, baselineText, onProgress)) {
+      if (await confirmDoubaoGenerationIfNeeded(win, onProgress)) {
         generationConfirmed = true;
       }
     }
@@ -2306,37 +2366,17 @@ async function findGeneratedConversationAndCopyShare(
     : [preferredConversationUrl])
     .map((value) => extractDoubaoConversationUrl(value))
     .filter((value): value is string => Boolean(value));
-  // 站点域名以字面量注入：这段脚本会跑在页面渲染进程里，拿不到任何模块级常量。
-  const siteHostRegExpSource = `^${appSiteHostRegExpSource()}$`;
-  const candidates = await runPageScript<string[]>(win, `
-    (() => {
-      const siteHostRegExp = new RegExp(${JSON.stringify(siteHostRegExpSource)}, "i");
-      const links = Array.from(document.querySelectorAll('a[href]'))
-        .map((link, index) => ({ href: link.href, index }))
-        .filter(({ href }) => {
-          try {
-            const url = new URL(href);
-            return siteHostRegExp.test(url.hostname)
-              && /^\\/chat\\/[A-Za-z0-9._~-]+/i.test(url.pathname);
-          } catch {
-            return false;
-          }
-        });
-      const unique = Array.from(new Map(links.map((item) => [item.href, item])).values());
-      // 按 DOM（侧边栏“最近”列表）顺序返回：会话越新排在越前面。
-      // 匹配目标会话不再依赖提示词，直接以最新对话优先。
-      return unique
-        .sort((a, b) => a.index - b.index)
-        .map((item) => item.href)
-        .slice(0, 30);
-    })()
-  `);
-  // 记录会话必须排在最前：即使窗口此刻停在别的会话上，也不能把它丢掉。
-  // 之前“当前地址 || 记录地址”的写法会让恢复只查陌生会话（表现为“未找到已生成视频”）。
-  const orderedCandidates = Array.from(new Set([
-    ...preferredUrls,
-    ...candidates
-  ]));
+  // 只检查本次提交记录的会话，**绝不扫描侧边栏「最近对话」里的其它会话**。
+  //
+  // 实测：同一批任务的提示词高度雷同，两个不同任务的提示词互相命中 4/5、5/5 个签名窗口
+  // （见 .codebuddy/memory/2026-10-19.md），靠提示词/相似度根本区分不出哪条是本次的。
+  // 只要往下扫，本次还没生成完时就一定会拿到上一个任务的旧视频——
+  // doubao-66780b12877c48d0 取到第二个对话、doubao-d5e16b2466c4459c 取到第三个对话，
+  // 都把无关视频交付给了去水印。
+  //
+  // 记录会话是提交后 waitForSubmittedConversationUrl 记下的本次会话，只认它；
+  // 认不到就判失败退额度，也不能乱认别人的会话。
+  const orderedCandidates = preferredUrls;
   const signatureLength = Math.min(42, normalizedPrompt.length);
   const signatureSpan = Math.max(0, normalizedPrompt.length - signatureLength);
   const signatures = Array.from(new Set([0, 0.25, 0.5, 0.75, 1]
@@ -2369,8 +2409,9 @@ async function findGeneratedConversationAndCopyShare(
     }
     visitedCount += 1;
 
-    // 读取页面文本仅用于诊断计数；提示词命中不再作为准入闸门：
-    // 站点可能改写提示词、页面文本也可能未渲染，用提示词卡掉候选会误伤正确会话。
+    // 归属闸门：只有「记录会话」或「命中本次提示词」的会话才可能是本次任务的结果。
+    // 其余会话里即便有视频，也是以前任务的旧视频，绝不能拿它的分享链接去水印
+    // （真机事故：本次未生成，却把第二个对话的视频交付了出去）。
     let pageText = "";
     for (let attempt = 0; attempt < 2; attempt += 1) {
       pageText = await runPageScript<string>(win, `document.body?.innerText || ""`);
@@ -2379,12 +2420,21 @@ async function findGeneratedConversationAndCopyShare(
     }
     const normalizedPageText = normalizeComparableText(pageText);
     const signatureMatches = signatures.filter((signature) => normalizedPageText.includes(signature)).length;
-    if (normalizedPageText.includes(normalizedPrompt) || signatureMatches >= requiredSignatureMatches) {
+    const promptMatched = normalizedPageText.includes(normalizedPrompt)
+      || signatureMatches >= requiredSignatureMatches;
+    if (promptMatched) {
       promptMatchCount += 1;
     }
+    if (!isConversationResultForCurrentTask({
+      // 只有记录会话（preferredUrls[0]）是"本次会话"；传入的第二个地址只是兜底，仍需提示词归属。
+      isRecordedConversation: candidate === preferredUrls[0],
+      promptMatched
+    })) {
+      continue;
+    }
 
-    // 记录会话就是本次任务的归属会话，给它完整等待；其余旧会话仍用短探针避免逐个长等。
-    const probeMs = preferredUrls.includes(candidate) ? VIDEO_CARD_WAIT_MS : RECOVERY_VIDEO_PROBE_MS;
+    // 记录会话就是本次任务的归属会话，给它完整等待；兜底地址仍用短探针。
+    const probeMs = candidate === preferredUrls[0] ? VIDEO_CARD_WAIT_MS : RECOVERY_VIDEO_PROBE_MS;
     const pageState = await waitForGeneratedVideoCard(win, probeMs);
     if (!pageState.generated || pageState.failed) continue;
     if (pageState.videoCardCount <= 0) {
