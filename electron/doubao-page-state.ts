@@ -62,30 +62,65 @@ export function isConversationResultForCurrentTask(input: {
   return input.isRecordedConversation || input.promptMatched;
 }
 
+/** 豆包真正开始生成视频时会在回话里带上这句额度提示，是「已开工」的强证据。 */
+export const DOUBAO_GENERATION_STARTED_TEXT = "本次生成将消耗每日免费额度";
+
+/** 需要二次确认时回复的词：像普通对话一样发出去，豆包收到后才开始生成。 */
+export const DOUBAO_GENERATION_CONFIRM_REPLY = "生成视频";
+
+/** 提交后给豆包留出把回话输出完的时间（约 10~15 秒），期间不急着补确认。 */
+export const DOUBAO_GENERATION_CONFIRM_GRACE_MS = 12000;
+
 /**
- * 判断页面上的「视频生成参数确认」面板是否仍在等待回复。
- *
- * 判定只看**面板之后**有没有出现回复词（OK / 确认），
- * 不能用"提交前的整页基线里有没有面板文案"来排除历史面板：
- * 执行窗口是按账号入口地址打开的，豆包会恢复**上一次任务的会话**，
- * 那个会话里可能残留着一个未回复的确认面板 → 基线里带着面板文案 →
- * 旧写法 `pageText.includes(marker) && !baseline.includes(marker)` 永远为假 →
- * 本次任务的面板明明就在页面上却一直识别不到，豆包后台也就永远不会开始生成。
- * （真机事故 doubao-66780b12877c48d0 / doubao-eb507d3a11db4044：面板可见、无 OK 回复。）
- *
- * 取面板**最后一次**出现的位置，避免被聊天里更早的历史面板干扰。
+ * `waitForGenerationResult` 主循环每轮的间隔。
+ * 完成检测、失败检测、拦截检测、分享链接复制都按这个节奏跑，别为了拉开
+ * 二次确认的间隔而放慢它——那样会把分享链接重试次数一起砍掉。
  */
-export function isDoubaoConfirmationAwaitingReply(pageText: string) {
-  const text = pageText.replace(/\s+/g, " ").trim();
-  const markers = ["视频生成参数确认", "确认后我再开始生成视频"];
-  const found = markers
-    .map((marker) => ({ marker, at: text.lastIndexOf(marker) }))
-    .filter((item) => item.at >= 0)
-    .sort((a, b) => b.at - a.at)[0];
-  if (!found) return false;
-  // 回复会作为用户消息紧跟在面板后面（如 "确认后我再开始生成视频。 OK 我将为你生成…"）。
-  const tail = text.slice(found.at + found.marker.length, found.at + found.marker.length + 24);
-  return !/(OK|确认)/.test(tail);
+export const GENERATION_POLL_INTERVAL_MS = 5000;
+
+/** 两次「生成视频」补发之间的最小间隔：给豆包时间消化上一条回复，避免连续追问。 */
+export const DOUBAO_GENERATION_CONFIRM_RETRY_MS = 30000;
+
+/** 「均进行二次确认」的重试上限：避免失败态里无限刷屏。 */
+export const DOUBAO_GENERATION_CONFIRM_MAX_REPLIES = 5;
+
+/**
+ * 豆包回话里有没有「已开始生成」的额度文案。
+ * 注意：本函数引用模块级常量，只在 Node 侧调用，**不要** toString() 注入页面。
+ */
+export function isDoubaoGenerationStarted(pageText: string) {
+  // 文案可能被 DOM 拆成多行/多节点，去掉全部空白再比。
+  return pageText.replace(/\s+/g, "").includes(DOUBAO_GENERATION_STARTED_TEXT);
+}
+
+/**
+ * 是否要补发一次「生成视频」二次确认。
+ *
+ * 判定标准（2026-11-04 改）：不再去猜「视频生成参数确认」面板的文案，
+ * 只要豆包回话里**没有**「本次生成将消耗每日免费额度」，就说明生成还没开始，
+ * 每轮轮询都补一次确认，最多 5 次。
+ *
+ * 四道闸门：
+ * - 提交后先等豆包回话稳定（宽限期），否则「没有文案」在头几秒恒成立会抢发；
+ * - 距上一条补发不足 30s 就不再发（主循环仍每 5s 判一次，只是被这道闸门挡住）；
+ * - 已出现失败文案 / 视频已生成，不再往对话里发东西；
+ * - 回复次数封顶，避免失败态里连发。
+ */
+export function shouldSendGenerationConfirmation(input: {
+  pageText: string;
+  elapsedMs: number;
+  replyCount: number;
+  /** null 表示还没有发过，首次补发不受间隔限制。 */
+  msSinceLastReply: number | null;
+  hasFailure: boolean;
+  generated: boolean;
+}) {
+  if (input.elapsedMs < DOUBAO_GENERATION_CONFIRM_GRACE_MS) return false;
+  if (input.replyCount >= DOUBAO_GENERATION_CONFIRM_MAX_REPLIES) return false;
+  if (input.msSinceLastReply !== null
+    && input.msSinceLastReply < DOUBAO_GENERATION_CONFIRM_RETRY_MS) return false;
+  if (input.hasFailure || input.generated) return false;
+  return !isDoubaoGenerationStarted(input.pageText);
 }
 
 export function isDoubaoPromptRewritePage(pageText: string) {

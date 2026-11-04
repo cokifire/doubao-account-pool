@@ -1,0 +1,516 @@
+{
+  "$comment": "waoo-video 项目「视频模型 / 视频生成接口」类型契约总览。由源码静态提取，供接入新视频模型或对接外部调用时参照。",
+  "meta": {
+    "project": "waoo-video",
+    "generatedFrom": [
+      "src/lib/ai-registry/types.ts",
+      "src/lib/ai-registry/video-capabilities.ts",
+      "src/lib/ai-registry/video-generation-availability.ts",
+      "src/lib/ai-registry/fixed-parameters.ts",
+      "src/lib/ai-registry/generation-reference-policy.ts",
+      "src/lib/ai-registry/model-aspect-ratios.ts",
+      "src/lib/ai-registry/selection.ts",
+      "src/lib/ai-exec/engine.ts",
+      "src/lib/ai-providers/runtime-types.ts",
+      "src/lib/ai-providers/manifest.ts",
+      "src/lib/ai-providers/shared/option-schema.ts",
+      "src/lib/ai-providers/fal/models.ts",
+      "src/lib/ai-providers/google/models.ts",
+      "src/lib/ai-providers/google/adapter.ts",
+      "src/lib/ai-providers/ark/option-schema.ts",
+      "src/lib/ai-providers/ark/video-models.ts",
+      "src/lib/ai-providers/openrouter/video-models.ts",
+      "src/lib/ai-providers/openai-compatible/option-schema.ts",
+      "src/lib/ai-exec/media-input-transport.ts",
+      "src/lib/workspace-resource/generation-contract.ts"
+    ],
+    "note": "本项目没有对外公开的 REST 视频生成 API；视频模型是内部 registry 注册的模型（provider::modelId），由 Task 引擎调用 provider adapter 执行。"
+  },
+
+  "modelIdentity": {
+    "modelKey": {
+      "format": "provider::modelId",
+      "separator": "::",
+      "parser": "parseModelKeyStrict (src/lib/ai-registry/selection.ts)",
+      "examples": ["fal::bytedance/seedance-2.0", "google::veo-3.1-generate-preview", "ark::doubao-seedance-2-5-260628", "openrouter::minimax/hailuo-3"],
+      "invalidError": "MODEL_KEY_INVALID: modelKey must be provider::modelId"
+    },
+    "unifiedModelType": ["llm", "image", "video", "music", "voice"],
+    "aiModality": ["llm", "vision", "image", "video", "music", "voice"],
+    "variantSubKind": ["official", "user-template"],
+    "variantDescriptor": {
+      "type": "AiVariantDescriptor",
+      "fields": {
+        "modelKey": "string",
+        "providerKey": "string",
+        "providerId": "string",
+        "modelId": "string",
+        "modality": "AiModality",
+        "familyRef": "string?",
+        "display": "{ name: string; sourceLabel: string; label: string }",
+        "execution": "{ mode: 'sync'|'async'|'stream'|'batch'; externalIdPrefix?: string }",
+        "capabilities": "ModelCapabilities（video 模型只允许 video 命名空间）",
+        "optionSchema": "AiOptionSchema",
+        "inputContracts": "Record<string, unknown>?"
+      },
+      "videoExecutionMode": "async（所有视频模型均为异步提交 + 轮询）"
+    },
+    "providerManifestEntry": {
+      "type": "ProviderCapabilityCatalogDeclaration",
+      "required": ["provider", "modelType", "modelId"],
+      "fields": {
+        "provider": "string",
+        "modelType": "'video'",
+        "modelId": "string",
+        "capabilities": "{ video: VideoCapabilities }",
+        "providerRoute": "unknown?"
+      }
+    },
+    "apiConfigCatalogEntry": {
+      "type": "ApiConfigCatalogModel",
+      "required": ["modelId", "name", "type", "provider"],
+      "videoExample": { "modelId": "bytedance/seedance-2.0", "name": "Seedance 2.0", "type": "video", "provider": "fal" }
+    }
+  },
+
+  "capabilities": {
+    "video": {
+      "type": "VideoCapabilities",
+      "namespaceRule": "modelType='video' 时 capabilities 只允许出现 video 命名空间；出现 llm/image/music/voice 报 CAPABILITY_NAMESPACE_INVALID",
+      "allowedFields": [
+        "firstFrameAspectRatio", "supportedInputModes", "supportsTextToVideo", "generationModeOptions",
+        "generateAudioOptions", "durationOptions", "resolutionOptions", "firstlastframe", "supportGenerateAudio",
+        "assetReferenceMultiReference", "maxReferenceImages", "maxReferenceAudios", "maxReferenceVideos",
+        "maxReferenceFiles", "referenceAudioRequiresVisual", "minReferenceAudioDurationMs",
+        "maxReferenceAudioDurationMs", "maxTotalReferenceAudioDurationMs", "minReferenceVideoDurationMs",
+        "maxReferenceVideoDurationMs", "minTotalReferenceVideoDurationMs", "maxTotalReferenceVideoDurationMs",
+        "referenceVideoMimeTypes", "maxTotalReferenceVideoBytes", "fieldI18n"
+      ],
+      "fields": {
+        "firstFrameAspectRatio": {
+          "type": "'selected' | 'adaptive'",
+          "required": false,
+          "validation": "必须是 selected 或 adaptive，否则 CAPABILITY_FIELD_INVALID",
+          "meaning": "selected=由用户选择宽高比；adaptive=跟随首帧图片比例"
+        },
+        "supportedInputModes": {
+          "type": "VideoInputMode[]",
+          "enum": ["text_to_video", "first_frame", "first_last_frame", "reference"],
+          "validation": "非空字符串数组、值合法、不可重复"
+        },
+        "supportsTextToVideo": { "type": "boolean", "validation": "必须为 boolean" },
+        "generationModeOptions": {
+          "type": "string[]",
+          "observedValues": ["normal", "firstlastframe"],
+          "validation": "非空字符串数组"
+        },
+        "generateAudioOptions": { "type": "boolean[]", "validation": "必须为 boolean 数组" },
+        "durationOptions": { "type": "number[]", "validation": "有限数数组（单位：秒）" },
+        "resolutionOptions": {
+          "type": "string[]",
+          "observedValues": ["480p", "720p", "768p", "1080p", "2K", "4k"],
+          "validation": "非空字符串数组"
+        },
+        "firstlastframe": { "type": "boolean", "meaning": "是否支持首尾帧" },
+        "supportGenerateAudio": { "type": "boolean", "meaning": "是否支持生成音频" },
+        "assetReferenceMultiReference": { "type": "boolean", "meaning": "是否支持多素材参考" },
+        "maxReferenceImages": { "type": "integer", "validation": "> 0" },
+        "maxReferenceAudios": { "type": "integer", "validation": "> 0" },
+        "maxReferenceVideos": { "type": "integer", "validation": "> 0" },
+        "maxReferenceFiles": { "type": "integer", "validation": "> 0（图+音+视频总数上限）" },
+        "referenceAudioRequiresVisual": { "type": "boolean", "meaning": "有音频参考时必须同时有图或视频参考" },
+        "minReferenceAudioDurationMs": { "type": "integer", "validation": "> 0" },
+        "maxReferenceAudioDurationMs": { "type": "integer", "validation": "> 0" },
+        "maxTotalReferenceAudioDurationMs": { "type": "integer", "validation": "> 0" },
+        "minReferenceVideoDurationMs": { "type": "integer", "validation": "> 0" },
+        "maxReferenceVideoDurationMs": { "type": "integer", "validation": "> 0" },
+        "minTotalReferenceVideoDurationMs": { "type": "integer", "validation": "> 0" },
+        "maxTotalReferenceVideoDurationMs": { "type": "integer", "validation": "> 0" },
+        "referenceVideoMimeTypes": { "type": "string[]", "validation": "非空且每项以 'video/' 开头" },
+        "maxTotalReferenceVideoBytes": { "type": "integer", "validation": "> 0" },
+        "fieldI18n": {
+          "type": "Record<string, CapabilityFieldI18n>",
+          "allowedKeys": ["generationMode", "generateAudio", "duration", "resolution"],
+          "shape": "{ labelKey?: string; unitKey?: string; optionLabelKeys?: Record<string,string> }",
+          "note": "用 fieldI18n，不是 i18n"
+        }
+      }
+    },
+    "validationErrorCodes": [
+      "CAPABILITY_SHAPE_INVALID",
+      "CAPABILITY_NAMESPACE_INVALID",
+      "CAPABILITY_FIELD_INVALID",
+      "CAPABILITY_VALUE_NOT_ALLOWED"
+    ],
+    "derivedFields": {
+      "effectiveCapabilityFields": "*Options 结尾的字段会被投影为可选项（去掉 Options 后缀）：generationMode、generateAudio、duration、resolution",
+      "fixedParameterFields": {
+        "video": ["resolution", "generateAudio"],
+        "allowUnset": true,
+        "source": "src/lib/ai-registry/fixed-parameters.ts"
+      },
+      "pricingProjection": "projectVideoGenerationAvailability 会把无报价的 resolution / inputMode 组合裁掉，返回 pricingLimited 标记"
+    }
+  },
+
+  "generationOptions": {
+    "type": "AiVideoExecutionOptions",
+    "source": "src/lib/ai-exec/engine.ts",
+    "indexSignature": "string | number | boolean | string[] | undefined",
+    "fields": {
+      "prompt": { "type": "string?", "note": "fal/google 可为空；openrouter 与 openai-compatible 要求非空" },
+      "duration": { "type": "number?", "unit": "秒", "note": "必须命中该模型 durationOptions" },
+      "resolution": { "type": "string?", "note": "必须命中 resolutionOptions；openai-compatible 也接受 WxH 形式（别名 size）" },
+      "aspectRatio": { "type": "string?", "note": "枚举由各 provider 的 option schema 决定" },
+      "generateAudio": { "type": "boolean?", "note": "必须命中 generateAudioOptions" },
+      "lastFrameImageUrl": { "type": "string?", "note": "仅 firstlastframe=true 的模型接受" },
+      "referenceImages": { "type": "string[]?", "note": "上限 maxReferenceImages" },
+      "referenceAudios": { "type": "string[]?", "note": "上限 maxReferenceAudios" },
+      "referenceVideos": { "type": "string[]?", "note": "上限 maxReferenceVideos" }
+    },
+    "sharedAllowedKeys": {
+      "source": "buildMediaOptionSchema('video') src/lib/ai-providers/shared/option-schema.ts",
+      "keys": [
+        "provider", "modelId", "modelKey", "prompt", "duration", "resolution", "aspectRatio",
+        "generateAudio", "lastFrameImageUrl", "size", "promptExtend", "serviceTier",
+        "executionExpiresAfter", "returnLastFrame", "draft", "seed", "cameraFixed", "watermark"
+      ],
+      "extendedByProviders": ["referenceImages", "referenceAudios", "referenceVideos"]
+    },
+    "validators": {
+      "enumValidator": "值必须在给定集合内，否则 unsupported_value=<v>",
+      "integerRangeValidator": "Number.isInteger 且落在 [min,max]",
+      "numberRangeValidator": "Number.isFinite 且落在 [min,max]",
+      "booleanValidator": "typeof === 'boolean'",
+      "nonEmptyStringValidator": "trim 后非空",
+      "stringArrayValidator": "每项 trim 后非空，且 length <= maxLength",
+      "passthroughValidator": "未单独声明的 key 默认放行"
+    }
+  },
+
+  "perProviderOptionSchemas": {
+    "fal": {
+      "builder": "buildVideoOptionSchema(capabilities, aspectRatios, objectValidators) src/lib/ai-providers/fal/models.ts",
+      "allowedKeys": [
+        "provider", "modelId", "modelKey", "prompt", "duration", "resolution", "aspectRatio",
+        "generateAudio", "lastFrameImageUrl", "referenceImages", "referenceAudios", "referenceVideos"
+      ],
+      "aspectRatios": {
+        "bytedance/seedance-2.0 与 /fast": ["auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"],
+        "fal-veo31": ["16:9", "9:16"],
+        "alibaba/happy-horse/image-to-video": ["16:9", "9:16", "1:1", "4:3", "3:4"],
+        "其他": ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "9:21"]
+      },
+      "objectValidators": {
+        "fal-veo31": "使用参考图或 resolution 为 1080p/4k 时 duration 必须为 8（duration=8_required_for_reference_or_high_resolution）"
+      },
+      "required": []
+    },
+    "google": {
+      "builder": "googleVideoOptions(modelId) src/lib/ai-providers/google/adapter.ts",
+      "allowedKeys": ["provider", "modelId", "modelKey", "prompt", "duration", "resolution", "aspectRatio", "generateAudio", "lastFrameImageUrl", "referenceImages", "referenceAudios", "referenceVideos"],
+      "aspectRatios": ["16:9", "9:16"],
+      "objectValidators": [
+        "有参考图 / lastFrameImageUrl / resolution=1080p|4k 时 duration 必须为 8",
+        "veo-3.0-* 且 resolution=1080p 时 aspectRatio 必须为 16:9"
+      ],
+      "required": []
+    },
+    "ark": {
+      "builder": "videoSchema(modelId) src/lib/ai-providers/ark/option-schema.ts",
+      "allowedKeys": [
+        "provider", "modelId", "modelKey", "prompt", "resolution", "aspectRatio", "duration",
+        "generateAudio", "watermark", "returnLastFrame", "serviceTier", "executionExpiresAfter",
+        "lastFrameImageUrl", "referenceImages", "referenceAudios", "referenceVideos"
+      ],
+      "aspectRatios": ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"],
+      "required": ["resolution", "aspectRatio", "duration"],
+      "constraints": {
+        "duration": "整数，落在 [durationMin, durationMax]",
+        "serviceTier": ["default"],
+        "executionExpiresAfter": "整数 3600..259200"
+      },
+      "objectValidators": [
+        "images+audios+videos > maxReferenceFiles → max_reference_files=<n>",
+        "referenceAudioRequiresVisual 且有音频但无图/视频 → reference_audio_requires_visual",
+        "lastFrameImageUrl 与任何参考同时存在 → last_frame_conflicts_with_references"
+      ]
+    },
+    "openrouter": {
+      "builder": "buildOpenRouterVideoOptionSchema(modelId) src/lib/ai-providers/openrouter/video-models.ts",
+      "allowedKeys": [
+        "provider", "modelId", "modelKey", "prompt", "duration", "resolution", "aspectRatio",
+        "generateAudio", "lastFrameImageUrl", "referenceImages", "referenceAudios", "referenceVideos",
+        "seed", "watermark"
+      ],
+      "excludedWhenUnsupported": {
+        "seed": "supportsSeed=false（hailuo 系列）",
+        "generateAudio": "supportGenerateAudio=false",
+        "lastFrameImageUrl": "supportedInputModes 不含 first_last_frame"
+      },
+      "alwaysExcluded": ["size", "promptExtend", "serviceTier", "executionExpiresAfter", "returnLastFrame", "draft", "cameraFixed"],
+      "aspectRatios": {
+        "bytedance/seedance-2.0 与 /fast": ["1:1", "3:4", "9:16", "4:3", "16:9", "21:9", "9:21"],
+        "bytedance/seedance-2.5": ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9"],
+        "minimax/hailuo-3 与 -3-max": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+      },
+      "required": ["prompt（非空，否则 OPENROUTER_VIDEO_PROMPT_REQUIRED）"],
+      "objectValidators": [
+        "images+audios+videos > maxReferenceFiles → total_reference_limit_exceeded",
+        "referenceAudioRequiresVisual 且有音频但无图/视频 → reference_audio_requires_visual",
+        "lastFrameImageUrl 与任何参考同时存在 → frame_with_references / references_with_lastFrameImageUrl"
+      ]
+    },
+    "openai-compatible": {
+      "builder": "resolveOpenAICompatibleOptionSchema('video') src/lib/ai-providers/openai-compatible/option-schema.ts",
+      "note": "BYOM（自带模型）通道：宽松放行，无内置能力目录",
+      "allowedKeys": [
+        "provider", "modelId", "modelKey", "prompt", "duration", "resolution", "aspectRatio",
+        "generateAudio", "lastFrameImageUrl", "size", "promptExtend", "serviceTier",
+        "executionExpiresAfter", "returnLastFrame", "draft", "seed", "cameraFixed", "watermark",
+        "referenceImages", "referenceAudios", "referenceVideos"
+      ],
+      "constraints": {
+        "duration": "正整数秒",
+        "size": "非空字符串（WxH 形式）",
+        "resolution": "非空字符串",
+        "aspectRatio": "非空字符串",
+        "lastFrameImageUrl": "声明但拒绝 → unsupported_by_endpoint",
+        "referenceImages": "声明但拒绝 → unsupported_by_endpoint",
+        "referenceAudios": "声明但拒绝 → unsupported_by_endpoint",
+        "referenceVideos": "声明但拒绝 → unsupported_by_endpoint"
+      },
+      "required": ["prompt（非空，否则 OPENAI_COMPATIBLE_VIDEO_PROMPT_REQUIRED）"]
+    }
+  },
+
+  "referenceInputs": {
+    "inputModes": {
+      "text_to_video": { "imageCount": 0 },
+      "first_frame": { "imageCount": 1 },
+      "first_last_frame": { "imageCount": 2 },
+      "reference": { "imageCount": "0..min(maxReferenceImages, maxReferenceFiles)" }
+    },
+    "modeDerivation": "src/lib/ai-registry/generation-reference-policy.ts generationVideoInputMode()：有 last_frame → first_last_frame；否则有 first_frame → first_frame；否则有非 context 参考 → reference；否则 text_to_video",
+    "channel": ["context", "image", "audio", "video"],
+    "validRoles": {
+      "image": ["first_frame", "last_frame", "reference_image"],
+      "audio": ["reference_audio"],
+      "video": ["reference_video"],
+      "context": "任意（不计入 provider 参考上限）"
+    },
+    "validationCodes": [
+      "VIDEO_REFERENCE_ROLE_INVALID",
+      "VIDEO_MODEL_INPUT_MODE_UNSUPPORTED",
+      "VIDEO_MODEL_FRAME_INPUT_INVALID",
+      "VIDEO_MODEL_REFERENCE_LIMIT_EXCEEDED",
+      "VIDEO_MODEL_AUDIO_REFERENCE_LIMIT_EXCEEDED",
+      "VIDEO_MODEL_VIDEO_REFERENCE_LIMIT_EXCEEDED",
+      "VIDEO_MODEL_TOTAL_REFERENCE_LIMIT_EXCEEDED",
+      "VIDEO_MODEL_REFERENCE_AUDIO_REQUIRES_VISUAL"
+    ],
+    "mediaInputTransport": {
+      "type": "'inline-data-url' | 'public-https'",
+      "default": "cloud 部署 = public-https；自托管 = inline-data-url",
+      "declaration": "AiProviderManifest.mediaInputs: { modality:'video', transports: { image: [...], audio: [...], video: [...] } }",
+      "unsupportedError": "MEDIA_INPUT_TRANSPORT_UNSUPPORTED:<provider>:video:<kind>:<transport>",
+      "note": "某 provider 不支持某种传输时，其 video capabilities 会被 projectEffectiveMediaCapabilities 相应裁剪（参考数量归零、inputMode 被过滤）"
+    }
+  },
+
+  "execution": {
+    "engineEntry": "generateVideo(userId, modelKey, imageUrl, options?, invocation?) — src/lib/ai-exec/engine.ts",
+    "mediaExecutionInputVideoVariant": {
+      "modality": "'video'",
+      "userId": "string",
+      "modelKey": "string（provider::modelId）",
+      "imageUrl": "string（首帧，无首帧时传空串）",
+      "options": "AiVideoExecutionOptions?"
+    },
+    "providerContext": {
+      "type": "AiProviderVideoExecutionContext",
+      "fields": {
+        "userId": "string",
+        "providerConfig": "{ id: string; name: string; apiKey: string; baseUrl?: string }",
+        "selection": "{ provider: string; modelId: string; modelKey: string; variantSubKind: 'official'|'user-template'; variantData?: object }",
+        "imageUrl": "string",
+        "options": "AiVideoExecutionOptions?"
+      }
+    },
+    "adapterContract": {
+      "type": "AiProviderMediaModalityAdapter<'video'>",
+      "members": {
+        "describe": "(selection) => AiVariantDescriptor",
+        "execute": "(input: AiProviderVideoExecutionContext) => Promise<GenerateResult>"
+      },
+      "providerAdapterShape": "{ providerKey, failure, image?, video?, music?, voice?, languageModel?, resolveLlmSessionId?, connectionTest? }"
+    },
+    "result": {
+      "type": "GenerateResult",
+      "fields": {
+        "success": "true（字面量）",
+        "videoUrl": "string?（同步返回时）",
+        "audioUrl": "string?",
+        "imageUrl": "string?",
+        "imageUrls": "string[]?",
+        "imageBase64": "string?",
+        "audioBase64": "string?",
+        "audioMimeType": "string?",
+        "metadata": "Record<string, unknown>?",
+        "requestId": "string?（provider 侧任务 id）",
+        "async": "boolean?（视频提交恒为 true）",
+        "endpoint": "string?",
+        "externalId": "string?（用于异步轮询）"
+      },
+      "externalIdFormats": {
+        "fal": "FAL:VIDEO:<endpoint>:<requestId>",
+        "google": "GOOGLE:VIDEO:<operationName>",
+        "openrouter": "OPENROUTER:VIDEO:<requestId>",
+        "openai-compatible": "由 buildOpenAICompatibleVideoExternalId(providerId, jobId) 生成",
+        "ark": "经 ark async-task provider 注册"
+      }
+    },
+    "asyncLifecycle": {
+      "phases": ["submit", "poll", "cancel", "result", "stream", "connection", "search"],
+      "pendingStatuses": {
+        "openrouter": ["pending", "in_progress"],
+        "openai-compatible": ["queued", "pending", "in_progress", "processing", "running"]
+      },
+      "completedStatuses": {
+        "openrouter": ["completed"],
+        "openai-compatible": ["completed", "succeeded", "success"]
+      },
+      "failedStatuses": {
+        "openrouter": ["failed", "cancelled", "canceled", "expired"],
+        "openai-compatible": ["failed", "error", "cancelled", "canceled", "expired"]
+      },
+      "queueTimeout": "ProviderQueueTimeoutError → AppError 'GENERATION_QUEUE_TIMEOUT'，先标记 replay_authorized 再尽力取消 provider 任务"
+    }
+  },
+
+  "providerWirePayloads": {
+    "fal": {
+      "submit": "POST 队列端点，payload 由 buildFalVideoRequest 生成",
+      "seedance-2.0 / fast": {
+        "text-to-video": "{ prompt, duration(string), resolution, aspect_ratio, generate_audio }",
+        "image-to-video": "{ prompt, duration(string), resolution, aspect_ratio, generate_audio, image_url, end_image_url? }",
+        "reference-to-video": "{ prompt, duration(string), resolution, aspect_ratio, generate_audio, image_urls?, audio_urls?, video_urls? }"
+      },
+      "fal-veo31": "duration 形如 '8s'",
+      "fal-wan25": "{ prompt, image_url, duration(string), resolution }",
+      "kling-v3-*": "{ prompt, start_image_url, end_image_url?, duration, generate_audio:false }",
+      "firstFrameRule": "其余模型必须提供 imageUrl，否则 FAL_VIDEO_FIRST_FRAME_REQUIRED:<modelId>"
+    },
+    "google": {
+      "sdk": "GoogleGenAI.models.generateVideos",
+      "request": "{ model, prompt?, image?: {mimeType, imageBytes}, config?: { aspectRatio?, resolution?, durationSeconds?, referenceImages?: [{ image:{mimeType,imageBytes}, referenceType:'asset' }], lastFrame?: {mimeType,imageBytes} } }",
+      "rules": [
+        "图片需先转 base64 data URL（normalizeToBase64ForGeneration）",
+        "lastFrame 必须有 image 输入，否则 'Veo lastFrame requires image input'",
+        "返回需含 operation name，否则 'Veo 未返回 operation name'"
+      ]
+    },
+    "openrouter": {
+      "sdk": "OpenRouter SDK videoGeneration.generate(VideoGenerationRequest)",
+      "base": "{ model, prompt, duration?, resolution?, aspectRatio?, generateAudio?, seed?, provider?: { options: { seed|minimax: { parameters: { watermark|aigc_watermark: boolean } } } } }",
+      "firstFrameOnly": "frameImages: [{ type:'image_url', frameType:'first_frame', imageUrl:{url} }]",
+      "firstLastFrame": "frameImages: [first_frame, last_frame]",
+      "references": "inputReferences: [{type:'image_url',imageUrl:{url}} | {type:'audio_url',audioUrl:{url}} | {type:'video_url',videoUrl:{url}}]",
+      "rules": [
+        "lastFrameImageUrl 必须与 imageUrl 同时存在",
+        "frame 与 references 互斥",
+        "完成态读取 response.unsignedUrls[0]（相对 URL 会按 baseUrl 解析）"
+      ]
+    },
+    "openai-compatible": {
+      "submit": "POST {baseUrl}/videos，multipart/form-data：model, prompt, seconds?, size?, input_reference?(首帧二进制)",
+      "poll": "GET {baseUrl}/videos/{id}",
+      "content": "GET {baseUrl}/videos/{id}/content（需带 Authorization: Bearer <apiKey>）",
+      "rules": [
+        "seconds 为字符串",
+        "size 优先；resolution 若为 WxH 形式则作为 size 别名",
+        "响应必须含 id，否则 OPENAI_COMPATIBLE_VIDEO_JOB_ID_MISSING"
+      ]
+    },
+    "ark": {
+      "note": "经 ark async-task provider 提交（Seedance 系列），capabilities 由 ArkVideoModelSpec 生成",
+      "resolutionEnum": ["480p", "720p", "1080p", "4k"]
+    }
+  },
+
+  "registeredVideoModels": {
+    "fal": [
+      { "modelId": "fal-wan25", "name": "Wan 2.6", "durationOptions": [5, 10, 15], "resolutionOptions": ["720p", "1080p"], "supportedInputModes": ["first_frame"], "firstlastframe": false, "supportGenerateAudio": false, "firstFrameAspectRatio": "adaptive" },
+      { "modelId": "fal-veo31", "name": "Veo 3.1", "durationOptions": [4, 6, 8], "resolutionOptions": ["720p", "1080p", "4k"], "supportedInputModes": ["first_frame", "reference"], "firstlastframe": false, "supportGenerateAudio": true, "maxReferenceImages": 3, "maxReferenceFiles": 3, "firstFrameAspectRatio": "selected" },
+      { "modelId": "alibaba/happy-horse/image-to-video", "name": "Happy Horse 1.0", "durationOptions": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "resolutionOptions": ["720p", "1080p"], "supportedInputModes": ["first_frame", "reference"], "firstlastframe": false, "supportGenerateAudio": false, "maxReferenceImages": 9, "maxReferenceFiles": 9, "firstFrameAspectRatio": "adaptive" },
+      { "modelId": "bytedance/seedance-2.0", "name": "Seedance 2.0", "durationOptions": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "resolutionOptions": ["480p", "720p", "1080p"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "maxReferenceImages": 9, "maxReferenceAudios": 3, "maxReferenceVideos": 3, "maxReferenceFiles": 12, "referenceAudioRequiresVisual": true },
+      { "modelId": "bytedance/seedance-2.0/fast", "name": "Seedance 2.0 Fast", "durationOptions": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "resolutionOptions": ["480p", "720p"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "maxReferenceImages": 9, "maxReferenceAudios": 3, "maxReferenceVideos": 3, "maxReferenceFiles": 12, "referenceAudioRequiresVisual": true },
+      { "modelId": "fal-ai/kling-video/v2.5-turbo/pro/image-to-video", "name": "Kling 2.5 Turbo Pro", "durationOptions": [5, 10], "supportedInputModes": ["first_frame", "first_last_frame"], "firstlastframe": true, "supportGenerateAudio": false, "firstFrameAspectRatio": "adaptive" },
+      { "modelId": "fal-ai/kling-video/o3/standard/image-to-video", "name": "Kling O3 Standard", "durationOptions": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "supportedInputModes": ["first_frame", "first_last_frame"], "firstlastframe": true, "supportGenerateAudio": true, "firstFrameAspectRatio": "adaptive" },
+      { "modelId": "fal-ai/kling-video/o3/pro/image-to-video", "name": "Kling O3 Pro", "durationOptions": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "supportedInputModes": ["first_frame", "first_last_frame"], "firstlastframe": true, "supportGenerateAudio": true, "firstFrameAspectRatio": "adaptive" },
+      { "modelId": "fal-ai/kling-video/v3/standard/image-to-video", "name": "Kling 3 Standard", "durationOptions": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "supportedInputModes": ["first_frame", "first_last_frame"], "firstlastframe": true, "supportGenerateAudio": false, "firstFrameAspectRatio": "adaptive" },
+      { "modelId": "fal-ai/kling-video/v3/pro/image-to-video", "name": "Kling 3 Pro", "durationOptions": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "supportedInputModes": ["first_frame", "first_last_frame"], "firstlastframe": true, "supportGenerateAudio": false, "firstFrameAspectRatio": "adaptive" }
+    ],
+    "google": [
+      { "modelId": "veo-3.1-generate-preview", "name": "Veo 3.1", "durationOptions": [4, 6, 8], "resolutionOptions": ["720p", "1080p", "4k"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "generateAudioOptions": [true], "maxReferenceImages": 3, "maxReferenceFiles": 3, "firstFrameAspectRatio": "selected" },
+      { "modelId": "veo-3.1-fast-generate-preview", "name": "Veo 3.1 Fast", "durationOptions": [4, 6, 8], "resolutionOptions": ["720p", "1080p", "4k"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "generateAudioOptions": [true], "maxReferenceImages": 3, "maxReferenceFiles": 3, "firstFrameAspectRatio": "selected" },
+      { "modelId": "veo-3.0-generate-001", "name": "Veo 3.0", "durationOptions": [8], "resolutionOptions": ["720p", "1080p"], "supportedInputModes": ["text_to_video", "first_frame"], "firstlastframe": false, "supportGenerateAudio": true, "generateAudioOptions": [true] },
+      { "modelId": "veo-3.0-fast-generate-001", "name": "Veo 3.0 Fast", "durationOptions": [8], "resolutionOptions": ["720p", "1080p"], "supportedInputModes": ["text_to_video", "first_frame"], "firstlastframe": false, "supportGenerateAudio": true, "generateAudioOptions": [true] },
+      { "modelId": "veo-2.0-generate-001", "name": "Veo 2.0", "durationOptions": [5, 6, 8], "supportedInputModes": ["text_to_video", "first_frame"], "firstlastframe": false, "supportGenerateAudio": false }
+    ],
+    "ark": [
+      { "modelId": "doubao-seedance-2-0-260128", "name": "Seedance 2.0", "durationRange": [4, 15], "resolutionOptions": ["480p", "720p", "1080p", "4k"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "maxReferenceImages": 9, "maxReferenceAudios": 3, "maxReferenceVideos": 3, "maxReferenceFiles": 15, "referenceAudioRequiresVisual": true, "firstFrameAspectRatio": "selected" },
+      { "modelId": "doubao-seedance-2-0-fast-260128", "name": "Seedance 2.0 Fast", "durationRange": [4, 15], "resolutionOptions": ["480p", "720p"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "maxReferenceImages": 9, "maxReferenceAudios": 3, "maxReferenceVideos": 3, "maxReferenceFiles": 15, "referenceAudioRequiresVisual": true, "firstFrameAspectRatio": "selected" },
+      { "modelId": "doubao-seedance-2-5-260628", "name": "Seedance 2.5", "durationRange": [4, 30], "resolutionOptions": ["480p", "720p", "1080p"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "maxReferenceImages": 30, "maxReferenceAudios": 10, "maxReferenceVideos": 10, "maxReferenceFiles": 50, "referenceAudioRequiresVisual": false, "firstFrameAspectRatio": "adaptive" }
+    ],
+    "openrouter": [
+      { "modelId": "bytedance/seedance-2.0", "name": "Seedance 2.0", "durationOptions": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "resolutionOptions": ["480p", "720p", "1080p"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "supportsSeed": true, "watermarkParameter": "watermark" },
+      { "modelId": "bytedance/seedance-2.0-fast", "name": "Seedance 2.0 Fast", "durationOptions": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "resolutionOptions": ["480p", "720p"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "supportsSeed": true, "watermarkParameter": "watermark" },
+      { "modelId": "bytedance/seedance-2.5", "name": "Seedance 2.5", "durationOptions": "4..30", "resolutionOptions": ["480p", "720p"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "maxReferenceImages": 30, "maxReferenceAudios": 10, "maxReferenceVideos": 10, "maxReferenceFiles": 50, "referenceAudioRequiresVisual": false, "supportsSeed": true, "watermarkParameter": "watermark" },
+      { "modelId": "minimax/hailuo-3", "name": "MiniMax H3", "durationOptions": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "resolutionOptions": ["2K"], "supportedInputModes": ["text_to_video", "first_frame", "first_last_frame", "reference"], "firstlastframe": true, "supportGenerateAudio": true, "maxReferenceImages": 9, "maxReferenceFiles": 9, "supportsSeed": false, "watermarkParameter": "aigc_watermark" },
+      { "modelId": "minimax/hailuo-3-max", "name": "MiniMax H3 Max", "durationOptions": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "resolutionOptions": ["480p", "768p"], "supportedInputModes": ["text_to_video", "first_frame"], "firstlastframe": false, "supportGenerateAudio": false, "supportsSeed": false, "watermarkParameter": "aigc_watermark" }
+    ],
+    "openai-compatible": {
+      "note": "无内置模型目录（BYOM）。用户在 provider 上绑定任意 modelId，option schema 宽松放行；仅支持 text-to-video 与首帧（input_reference），不支持参考数组与尾帧。"
+    }
+  },
+
+  "taskPayload": {
+    "protocol": "workspace_resource_generation_v2",
+    "source": "src/lib/workspace-resource/generation-contract.ts",
+    "summary": "画布资源生成任务（含视频）冻结后的入参信封，zod strict 校验",
+    "fields": {
+      "lifecycleProjection": "object（任务生命周期投影）",
+      "protocol": "'workspace_resource_generation_v2'（字面量）",
+      "resource": {
+        "resourceId": "string 1..32",
+        "workspacePath": "string 1..512",
+        "mediaType": "'image' | 'audio' | 'video'",
+        "schemaId": "string 1..96",
+        "inputHash": "string，长度必须 64（重试源为 1..64）",
+        "prompt": "string 1..100000 且 trim 后非空；视频必填",
+        "modelKey": "string 1..191",
+        "inputs": "Array<{ resourceId, contentVersion(int>0), workspacePath, role, position(int>=0) }>，position 唯一",
+        "imageInputPositions": "number[]",
+        "audioInputPositions": "number[]",
+        "videoInputPositions": "number[]",
+        "toolCallId": "string|null",
+        "sourceTurnId": "string|null"
+      },
+      "imageModel": "string?",
+      "videoModel": "string?",
+      "musicModel": "string?",
+      "voiceModel": "string?",
+      "previewText": "string 1..20000?",
+      "language": "string 1..32?",
+      "durationSeconds": "int 1..600?（mediaType='video' 时必填）",
+      "count": "1（字面量）",
+      "generationOptions": "Record<string, string|number|boolean|null|array|object>"
+    },
+    "videoRules": [
+      "mediaType='video' 时 prompt 不可为 null",
+      "mediaType='video' 时 durationSeconds 必填（1..600）",
+      "imageInputPositions / audioInputPositions / videoInputPositions 之间不可重叠，且必须命中 inputs 中已声明的 position"
+    ]
+  }
+}

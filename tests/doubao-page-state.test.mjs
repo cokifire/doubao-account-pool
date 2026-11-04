@@ -14,7 +14,13 @@ import {
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
   isConversationResultForCurrentTask,
-  isDoubaoConfirmationAwaitingReply,
+  DOUBAO_GENERATION_CONFIRM_GRACE_MS,
+  DOUBAO_GENERATION_CONFIRM_MAX_REPLIES,
+  DOUBAO_GENERATION_CONFIRM_REPLY,
+  DOUBAO_GENERATION_CONFIRM_RETRY_MS,
+  GENERATION_POLL_INTERVAL_MS,
+  isDoubaoGenerationStarted,
+  shouldSendGenerationConfirmation,
   isGenerationReadyForShare,
   isLocalDraftDoubaoConversationUrl,
   isPromptMovedOutOfComposer,
@@ -41,28 +47,111 @@ test('rejects videos from conversations that do not belong to the current task',
   )
 })
 
-test('detects a confirmation panel that is still waiting for a reply', () => {
-  // 真机事故样本（debug/doubao-eb507d3a11db4044）：面板就在页面上、后面没有任何回复词，
-  // 程序却从未识别到 —— 旧逻辑用"提交前基线里有没有面板文案"来排除历史面板，
-  // 而执行窗口恢复的上一次会话里正好残留着未回复的面板，于是本次面板被永久忽略。
-  const unanswered = [
-    '生成视频：画面：微观金属基底表面。',
-    '我将生成一条微观金属表面等离子清洗概念视频。',
-    '视频生成参数确认',
-    '模型： Seedance 2.0 Mini',
-    '时长： 10 秒',
-    '确认后我再开始生成视频。',
-    '今天 23:09 对话 视频生成'
-  ].join(' ')
-  assert.equal(isDoubaoConfirmationAwaitingReply(unanswered), true)
+test('recognizes the quota notice meaning Doubao actually started generating', () => {
+  assert.equal(
+    isDoubaoGenerationStarted('本次使用 Seedance 2.0 Mini 生成，预计等待 20 分钟。视频生成好后，我会主动发送给你。本次生成将消耗每日免费额度。'),
+    true
+  )
+  // 文案可能被 DOM 拆行，空白不该影响判定。
+  assert.equal(isDoubaoGenerationStarted('本次生成将消耗 每日免费额度。'), true)
+  // 「视频生成参数确认」面板代表还在等待确认，不是已开始生成。
+  assert.equal(isDoubaoGenerationStarted('视频生成参数确认 确认后我再开始生成视频。'), false)
+  assert.equal(isDoubaoGenerationStarted(''), false)
+})
 
-  // 已经回复过：OK 作为用户消息紧跟在面板之后，不能再重复回复。
-  const answered = '确认后我再开始生成视频。 OK 我将为你生成一条 10 秒的视频。'
-  assert.equal(isDoubaoConfirmationAwaitingReply(answered), false)
+test('waits for Doubao reply to settle before sending any confirmation', () => {
+  const pendingPage = '视频生成参数确认 确认后我再开始生成视频。'
+  const decide = (elapsedMs) => shouldSendGenerationConfirmation({
+    pageText: pendingPage,
+    elapsedMs,
+    replyCount: 0,
+    msSinceLastReply: null,
+    hasFailure: false,
+    generated: false
+  })
 
-  // 页面上没有面板。
-  assert.equal(isDoubaoConfirmationAwaitingReply('你的视频生成好了。 和豆包继续聊'), false)
-  assert.equal(isDoubaoConfirmationAwaitingReply(''), false)
+  assert.equal(decide(0), false)
+  assert.equal(decide(DOUBAO_GENERATION_CONFIRM_GRACE_MS - 1), false)
+  assert.equal(decide(DOUBAO_GENERATION_CONFIRM_GRACE_MS), true)
+})
+
+test('confirms on every poll without the quota notice, capped at five replies', () => {
+  const decide = (replyCount, pageText = '视频生成参数确认 确认后我再开始生成视频。') =>
+    shouldSendGenerationConfirmation({
+      pageText,
+      elapsedMs: DOUBAO_GENERATION_CONFIRM_GRACE_MS,
+      replyCount,
+      msSinceLastReply: null,
+      hasFailure: false,
+      generated: false
+    })
+
+  assert.equal(decide(0), true)
+  assert.equal(decide(DOUBAO_GENERATION_CONFIRM_MAX_REPLIES - 1), true)
+  assert.equal(decide(DOUBAO_GENERATION_CONFIRM_MAX_REPLIES), false)
+  // 豆包已经开始生成，就不再补确认。
+  assert.equal(decide(0, '本次使用 Seedance 2.0 Mini 生成。本次生成将消耗每日免费额度。'), false)
+})
+
+test('does not send a confirmation into a failed or already-generated task', () => {
+  const base = {
+    pageText: '视频生成参数确认 确认后我再开始生成视频。',
+    elapsedMs: DOUBAO_GENERATION_CONFIRM_GRACE_MS,
+    replyCount: 0,
+    msSinceLastReply: null,
+    hasFailure: false,
+    generated: false
+  }
+
+  assert.equal(shouldSendGenerationConfirmation({ ...base, hasFailure: true }), false)
+  assert.equal(shouldSendGenerationConfirmation({ ...base, generated: true }), false)
+})
+
+test('the confirmation reply text is 生成视频', () => {
+  assert.equal(DOUBAO_GENERATION_CONFIRM_REPLY, '生成视频')
+})
+
+test('the main loop polls every 5 seconds', () => {
+  assert.equal(GENERATION_POLL_INTERVAL_MS, 5000)
+})
+
+test('blocks a second confirmation until 30s after the previous reply', () => {
+  const base = {
+    pageText: '视频生成参数确认 确认后我再开始生成视频。',
+    elapsedMs: DOUBAO_GENERATION_CONFIRM_GRACE_MS + 60000,
+    replyCount: 1,
+    hasFailure: false,
+    generated: false
+  }
+
+  assert.equal(DOUBAO_GENERATION_CONFIRM_RETRY_MS, 30000)
+  // 还没有上一条回复（首次）不受间隔限制。
+  assert.equal(shouldSendGenerationConfirmation({ ...base, msSinceLastReply: null }), true)
+  assert.equal(shouldSendGenerationConfirmation({ ...base, msSinceLastReply: DOUBAO_GENERATION_CONFIRM_RETRY_MS - 1 }), false)
+  assert.equal(shouldSendGenerationConfirmation({ ...base, msSinceLastReply: DOUBAO_GENERATION_CONFIRM_RETRY_MS }), true)
+})
+
+test('spaces five confirmations 30s apart on a 5-second main loop', () => {
+  const replyTimes = []
+  let lastReplyAt = null
+  for (let elapsedMs = 0; elapsedMs <= 180000; elapsedMs += GENERATION_POLL_INTERVAL_MS) {
+    const shouldReply = shouldSendGenerationConfirmation({
+      pageText: '视频生成参数确认 确认后我再开始生成视频。',
+      elapsedMs,
+      replyCount: replyTimes.length,
+      msSinceLastReply: lastReplyAt === null ? null : elapsedMs - lastReplyAt,
+      hasFailure: false,
+      generated: false
+    })
+    if (shouldReply) {
+      replyTimes.push(elapsedMs)
+      lastReplyAt = elapsedMs
+    }
+  }
+
+  // 宽限期 12s 后第一个 5s 轮询点是 15s，之后每次都要再等满 30s。
+  assert.deepEqual(replyTimes, [15000, 45000, 75000, 105000, 135000])
+  assert.equal(replyTimes.length, DOUBAO_GENERATION_CONFIRM_MAX_REPLIES)
 })
 
 test('detects Doubao infringement and violation failures', () => {

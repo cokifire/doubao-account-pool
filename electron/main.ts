@@ -46,7 +46,7 @@ async function applyAccountFingerprint(account: Account): Promise<void> {
   ses.setUserAgent(account.userAgent);
   const preloadPath = path.join(fingerprintPreloadDir, `${account.id}.cjs`);
   await fs.mkdir(fingerprintPreloadDir, { recursive: true });
-  await fs.writeFile(preloadPath, buildFingerprintPreloadScript(account), "utf-8");
+  await fs.writeFile(preloadPath, buildFingerprintPreloadScript(account, { aggressive: db.getSettings().aggressiveFingerprint }), "utf-8");
   ses.setPreloads([preloadPath]);
 }
 

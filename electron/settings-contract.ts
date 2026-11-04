@@ -16,6 +16,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   executorEnabled: true,
   showExecutorWindow: false,
   autoCloseExecutorWindow: true,
+  humanizationEnabled: true,
+  aggressiveFingerprint: true,
   doubaoChatUrl: "https://www.doubao.com/chat",
   dolaChatUrl: "https://dola.com/chat",
   defaultModel: "seedance_2_0_mini",
@@ -77,6 +79,8 @@ export function normalizeSettings(raw: Record<string, unknown>): AppSettings {
     executorEnabled: asBoolean(raw.executorEnabled, DEFAULT_SETTINGS.executorEnabled),
     showExecutorWindow: asBoolean(raw.showExecutorWindow, DEFAULT_SETTINGS.showExecutorWindow),
     autoCloseExecutorWindow: asBoolean(raw.autoCloseExecutorWindow, DEFAULT_SETTINGS.autoCloseExecutorWindow),
+    humanizationEnabled: asBoolean(raw.humanizationEnabled, DEFAULT_SETTINGS.humanizationEnabled),
+    aggressiveFingerprint: asBoolean(raw.aggressiveFingerprint, DEFAULT_SETTINGS.aggressiveFingerprint),
     doubaoChatUrl: asText(raw.doubaoChatUrl, DEFAULT_SETTINGS.doubaoChatUrl),
     dolaChatUrl: asText(raw.dolaChatUrl, DEFAULT_SETTINGS.dolaChatUrl),
     defaultModel: VALID_MODELS.includes(raw.defaultModel as DoubaoModel)

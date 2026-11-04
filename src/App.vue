@@ -64,6 +64,8 @@ const settingsForm = reactive<AppSettings>({
   executorEnabled: true,
   showExecutorWindow: false,
   autoCloseExecutorWindow: true,
+  humanizationEnabled: true,
+  aggressiveFingerprint: true,
   doubaoChatUrl: "https://www.doubao.com/chat",
   dolaChatUrl: "https://dola.com/chat",
   defaultModel: "seedance_2_0_mini",
@@ -893,6 +895,14 @@ onBeforeUnmount(() => {
           <label class="checkbox-line">
             <input v-model="settingsForm.autoCloseExecutorWindow" type="checkbox" />
             完成后自动关闭执行窗口
+          </label>
+          <label class="checkbox-line">
+            <input v-model="settingsForm.humanizationEnabled" type="checkbox" />
+            拟人化输入（分段打字、鼠标轨迹、随机延时）
+          </label>
+          <label class="checkbox-line">
+            <input v-model="settingsForm.aggressiveFingerprint" type="checkbox" />
+            激进指纹补全（webdriver/plugins/WebGL/canvas/audio/语言时区）
           </label>
           <label>
             <span>豆包入口地址</span>

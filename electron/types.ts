@@ -68,6 +68,10 @@ export interface AppSettings {
   executorEnabled: boolean;
   showExecutorWindow: boolean;
   autoCloseExecutorWindow: boolean;
+  /** 拟人化输入：分段打字节奏、贝塞尔鼠标轨迹、随机抖动延时。 */
+  humanizationEnabled: boolean;
+  /** 激进指纹补全：webdriver/plugins/chrome/WebGL/canvas/audio/语言时区。 */
+  aggressiveFingerprint: boolean;
   doubaoChatUrl: string;
   dolaChatUrl: string;
   defaultModel: DoubaoModel;

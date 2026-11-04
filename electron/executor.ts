@@ -5,6 +5,9 @@ import type { AppDatabase } from "./database.js";
 import { AccountTaskScheduler } from "./account-scheduler.js";
 import { buildFingerprintPreloadScript } from "./fingerprint.js";
 import {
+  DOUBAO_GENERATION_CONFIRM_MAX_REPLIES,
+  DOUBAO_GENERATION_CONFIRM_REPLY,
+  GENERATION_POLL_INTERVAL_MS,
   extractDoubaoConversationUrl,
   extractDoubaoFailureMessage,
   extractDoubaoShareUrl,
@@ -12,7 +15,7 @@ import {
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
-  isDoubaoConfirmationAwaitingReply,
+  shouldSendGenerationConfirmation,
   isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
   isDoubaoPromptRewritePage,
@@ -34,6 +37,13 @@ import {
   type BlockerScanResult
 } from "./page-blockers.js";
 import { waitForReadiness } from "./readiness.js";
+import {
+  bezierPath,
+  createRng,
+  jitterDelay,
+  seedFromParts,
+  typingPlan
+} from "./human-input.js";
 import {
   COMPOSER_EDITABLE_SELECTOR,
   UPLOAD_FILE_BUTTON_SELECTOR,
@@ -124,8 +134,8 @@ const COMPOSER_WAIT_MS = 10000;
 // 点「新对话」后等地址切走的窗口：切不过来也只是回到旧行为，不需要太长。
 const NEW_CONVERSATION_WAIT_MS = 8000;
 
-// 豆包「视频生成参数确认」面板没有确认按钮，只能像普通对话一样回复这个词再发送。
-const GENERATION_CONFIRM_REPLY = "OK";
+// 二次确认的回复词、宽限期与重试上限都在 doubao-page-state.ts
+// （DOUBAO_GENERATION_CONFIRM_REPLY / shouldSendGenerationConfirmation）。
 
 const callbackQueues = new Map<string, Promise<void>>();
 
@@ -247,6 +257,7 @@ export class DoubaoExecutor {
 
       win = await this.createExecutionWindow(account, settings);
       this.activeWindows.set(requestId, win);
+      initHumanization(win, account.id, request.prompt, settings);
       await loadUrl(win, chatUrlForAppType(settings, account.appType));
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
@@ -339,6 +350,7 @@ export class DoubaoExecutor {
 
       win = await this.createExecutionWindow(account, settings);
       this.activeWindows.set(requestId, win);
+      initHumanization(win, account.id, request.prompt, settings);
       await loadUrl(win, chatUrlForAppType(settings, account.appType));
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
@@ -400,6 +412,17 @@ export class DoubaoExecutor {
       // 前一次失败的任务可能在输入框/参考图区残留内容，先清理一遍，
       // 否则新提示词会和旧的拼接、参考图也会叠加。
       await clearComposer(win);
+
+      // 提交前再确认视频生成模式仍在：模式可能因页面状态回退而丢失，
+      // 导致提示词被当成普通聊天（只回文字、不生成视频）。丢失则重新进入。
+      if (!(await findCompositeTriggerPoint(win))) {
+        await this.updateProgress({
+          requestId,
+          status: "running",
+          message: `检测到${siteLabel}视频生成模式已丢失，正在重新进入`
+        });
+        await activateVideoMode(win, request.model);
+      }
 
       const referenceImagePaths = request.referenceImagePaths && request.referenceImagePaths.length
         ? request.referenceImagePaths
@@ -659,7 +682,7 @@ export class DoubaoExecutor {
     const preloadDir = path.join(app.getPath("userData"), "fingerprint-preloads");
     await fs.mkdir(preloadDir, { recursive: true });
     const preloadPath = path.join(preloadDir, `${account.id}.cjs`);
-    await fs.writeFile(preloadPath, buildFingerprintPreloadScript(account), "utf-8");
+    await fs.writeFile(preloadPath, buildFingerprintPreloadScript(account, { aggressive: settings.aggressiveFingerprint }), "utf-8");
     ses.setPreloads([preloadPath]);
 
     return new BrowserWindow({
@@ -849,15 +872,21 @@ async function fillPrompt(win: BrowserWindow, prompt: string) {
     throw new Error(`没有找到豆包提示词输入框（${await describeComposerCandidates(win)}）`);
   }
 
+  const humanized = Boolean(humanizationByWindow.get(win)?.enabled);
   const attempts: Array<{ label: string; run: () => Promise<void> }> = [
     {
-      label: "insertText",
+      label: humanized ? "humanizedTyping" : "insertText",
       run: async () => {
         await sendMouseClick(win, target.x, target.y);
         await sendKeyboard(win, "A", ["control"], 100);
         await sendKeyboard(win, "A", ["meta"], 100);
         await sendKeyboard(win, "Backspace", undefined, 100);
-        await win.webContents.insertText(prompt);
+        if (humanized) {
+          // 分段拟人打字：逐段可信 IME 提交 + 段间停顿，避免整段瞬间注入。
+          await typePromptHumanly(win, prompt);
+        } else {
+          await win.webContents.insertText(prompt);
+        }
         await wait(900);
       }
     },
@@ -1239,7 +1268,7 @@ async function findKeywordPoint(win: BrowserWindow, keywords: string[]): Promise
         const style = getComputedStyle(el);
         return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
       };
-      const textOf = (el) => [el.innerText, el.textContent, el.getAttribute("aria-label"), el.getAttribute("title")]
+      const textOf = (el) => [el.innerText, el.textContent, el.getAttribute("aria-label"), el.getAttribute("title"), el.getAttribute("placeholder")]
         .filter(Boolean).join(" ").trim();
       const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, label, div[tabindex], span[tabindex]'))
         .filter((el) => visible(el));
@@ -1651,24 +1680,22 @@ export function describeVideoParameters(request: VideoParameterRequest): string 
 }
 
 /**
- * 豆包部分账号/前端版本在发送提示词后会回复一个「视频生成参数确认」面板，
- * 列出模型、时长、比例、主体、画面、声音、风格等，并说明「确认后我再开始生成视频」。
- * 这个确认没有按钮，只能像普通对话一样在输入框回复 OK 再发送；不回复的话
- * 视频根本不会开始生成，后续只会一直空等视频卡片。
+ * 补发一次「生成视频」二次确认。
+ *
+ * 豆包有时不会直接开始生成，而是先回一段「视频生成参数确认」；这类确认
+ * 没有按钮，只能像普通对话一样在输入框回复一个词再发送。判定是否要发由
+ * shouldSendGenerationConfirmation 负责，这里只管把这条消息发出去。
  */
-async function confirmDoubaoGenerationIfNeeded(
+async function sendGenerationConfirmation(
   win: BrowserWindow,
-  onProgress?: (message: string) => Promise<void> | void
+  replyCount: number,
+  onProgress: (message: string) => Promise<void> | void
 ) {
-  // 是否还在等回复只看面板自身（面板后面有没有回复词），不看提交前的整页基线：
-  // 执行窗口恢复的上一次会话里可能残留未回复的面板，用基线排除会让本次面板永远识别不到。
-  const pageText = await getPageText(win);
-  if (!isDoubaoConfirmationAwaitingReply(pageText)) return false;
+  await onProgress?.(
+    `豆包回话里没有「本次生成将消耗每日免费额度」，正在补发二次确认「${DOUBAO_GENERATION_CONFIRM_REPLY}」（第 ${replyCount}/${DOUBAO_GENERATION_CONFIRM_MAX_REPLIES} 次）`
+  );
 
-  await onProgress?.("检测到视频生成参数确认，正在回复 OK 开始生成");
-
-  // 确认动作就是一条普通对话回复：填进输入框再发送，与手动操作一致。
-  await fillPrompt(win, GENERATION_CONFIRM_REPLY);
+  await fillPrompt(win, DOUBAO_GENERATION_CONFIRM_REPLY);
 
   const sendPoint = await findComposerSendButtonPoint(win);
   if (sendPoint) {
@@ -1678,17 +1705,15 @@ async function confirmDoubaoGenerationIfNeeded(
   }
   await wait(1200);
 
-  // 输入框被清空说明 OK 真的发出去了；仍有残留就补一次回车再查一次。
-  if ((await inspectComposer(win, GENERATION_CONFIRM_REPLY)).promptPresent) {
+  // 输入框被清空说明回复真的发出去了；仍有残留就补一次回车再查一次。
+  if ((await inspectComposer(win, DOUBAO_GENERATION_CONFIRM_REPLY)).promptPresent) {
     await sendKeyboard(win, "Enter");
     await wait(1200);
   }
 
-  if ((await inspectComposer(win, GENERATION_CONFIRM_REPLY)).promptPresent) {
-    throw new Error(`回复 ${GENERATION_CONFIRM_REPLY} 后输入框仍有内容，未能确认开始生成`);
+  if ((await inspectComposer(win, DOUBAO_GENERATION_CONFIRM_REPLY)).promptPresent) {
+    throw new Error(`回复 ${DOUBAO_GENERATION_CONFIRM_REPLY} 后输入框仍有内容，未能确认开始生成`);
   }
-
-  return true;
 }
 
 async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, prompt: string) {
@@ -1788,6 +1813,72 @@ async function isPromptMovedToChat(win: BrowserWindow, prompt: string) {
       });
     })()
   `);
+}
+
+// —— 拟人化输入 ——
+// 每个执行窗口维护一份拟人化状态（种子 + 光标坐标 + 计数器），
+// 让打字节奏、鼠标轨迹、延时抖动都按“同一账号同一提示词可复现、不同提示词有变化”派生。
+interface HumanizationState {
+  enabled: boolean;
+  /** 基准种子（由账号 id + 提示词派生）。 */
+  seed: number;
+  /** 每次操作递增，保证同一窗口内的轨迹/节奏彼此不同。 */
+  counter: number;
+  /** 当前光标坐标，供贝塞尔移动连续而非跳变。 */
+  x: number;
+  y: number;
+}
+
+const humanizationByWindow = new WeakMap<BrowserWindow, HumanizationState>();
+
+function initHumanization(win: BrowserWindow, accountId: number, prompt: string, settings: AppSettings) {
+  humanizationByWindow.set(win, {
+    enabled: settings.humanizationEnabled,
+    seed: seedFromParts(accountId, prompt),
+    counter: 0,
+    x: 0,
+    y: 0
+  });
+}
+
+function nextSeed(state: HumanizationState): number {
+  return seedFromParts(state.seed, state.counter++);
+}
+
+/** 拟人延时：固定时长叠加小幅抖动；未启用拟人化时退化为普通 wait。 */
+async function humanWait(win: BrowserWindow, baseMs: number) {
+  const state = humanizationByWindow.get(win);
+  if (!state || !state.enabled) return wait(baseMs);
+  const rng = createRng(nextSeed(state));
+  await wait(jitterDelay(baseMs, rng));
+}
+
+/** 贝塞尔轨迹移动鼠标到目标坐标；未启用拟人化时退化为一次瞬移。 */
+async function moveMouseHumanly(win: BrowserWindow, toX: number, toY: number) {
+  const state = humanizationByWindow.get(win);
+  if (!state || !state.enabled) {
+    win.webContents.sendInputEvent({ type: "mouseMove", x: toX, y: toY });
+    await wait(80);
+    return;
+  }
+  const points = bezierPath({ x: state.x, y: state.y }, { x: toX, y: toY }, nextSeed(state));
+  const rng = createRng(nextSeed(state));
+  for (const point of points) {
+    win.webContents.sendInputEvent({ type: "mouseMove", x: point.x, y: point.y });
+    await wait(jitterDelay(14, rng, 0.5));
+  }
+  state.x = toX;
+  state.y = toY;
+}
+
+/** 分段拟人打字：逐段 insertText（可信 IME 提交），段间按计划停顿。 */
+async function typePromptHumanly(win: BrowserWindow, prompt: string) {
+  const state = humanizationByWindow.get(win);
+  const plan = typingPlan(prompt, state ? nextSeed(state) : 1);
+  for (const chunk of plan) {
+    await win.webContents.insertText(chunk.text);
+    if (chunk.pauseMs > 0) await wait(chunk.pauseMs);
+  }
 }
 
 async function sendKeyboard(
@@ -1923,9 +2014,11 @@ async function sendMouseMove(win: BrowserWindow, x: number, y: number) {
 }
 
 async function sendMouseClick(win: BrowserWindow, x: number, y: number) {
-  await sendMouseMove(win, x, y);
+  // 拟人化时走贝塞尔轨迹移动 + 轻微停顿，再按下/抬起，更接近真实点击。
+  await moveMouseHumanly(win, x, y);
+  await humanWait(win, 50);
   win.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
-  await wait(80);
+  await humanWait(win, 80);
   win.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
 }
 
@@ -2093,7 +2186,8 @@ async function waitForGenerationResult(
   let directVideoUrl: string | null = null;
   let shareFailureReason: string | null = null;
   let historyFallbackAttempted = false;
-  let generationConfirmed = false;
+  let confirmationReplyCount = 0;
+  let lastConfirmationReplyAt = 0;
 
   // 提交后窗口可能并未停在本次会话上（停留在列表页/首页，或中途被重定向走），
   // 主循环若直接在当前页轮询会长时间空等，最终只能靠历史兜底去找视频。
@@ -2111,15 +2205,6 @@ async function waitForGenerationResult(
   }
 
   while (Date.now() - startedAt < timeoutMs) {
-    // 豆包部分版本在收到提示词后会异步回复「视频生成参数确认」面板，要求在输入框
-    // 回复 OK 才真正开始生成。面板要等好几秒才出现（提交后立刻查会查不到），
-    // 所以放在主循环里检测；确认文案会留在聊天记录里，因此只回复一次。
-    if (!generationConfirmed) {
-      if (await confirmDoubaoGenerationIfNeeded(win, onProgress)) {
-        generationConfirmed = true;
-      }
-    }
-
     // 会员/权益/登录拦截：继续等待不会有结果，立即 fail-closed，让调度器换号。
     // 视频一旦生成就不再扫描——分享面板等浮层可能带营销文案，避免误判。
     if (!generatedAt) {
@@ -2182,6 +2267,25 @@ async function waitForGenerationResult(
       now: Date.now()
     });
 
+    // 二次确认：豆包回话里没有「本次生成将消耗每日免费额度」就说明还没开始生成。
+    // 主循环每 5s 都判，但判定函数会挡住「距上次补发不足 30s」的轮次，
+    // 这样不影响完成检测/分享链接重试，又不会连着追问豆包。最多补 5 次。
+    // 放在失败/拦截判定之后，避免把确认消息发进已经失败或已生成完的对话。
+    if (shouldSendGenerationConfirmation({
+      pageText: pageState.pageText,
+      elapsedMs: Date.now() - startedAt,
+      replyCount: confirmationReplyCount,
+      msSinceLastReply: confirmationReplyCount === 0
+        ? null
+        : Date.now() - lastConfirmationReplyAt,
+      hasFailure: Boolean(pageState.failureMessage),
+      generated: Boolean(generated) || Boolean(generatedAt)
+    })) {
+      confirmationReplyCount += 1;
+      await sendGenerationConfirmation(win, confirmationReplyCount, onProgress);
+      lastConfirmationReplyAt = Date.now();
+    }
+
     if (generated) {
       if (!generatedAt) {
         generatedAt = Date.now();
@@ -2232,7 +2336,7 @@ async function waitForGenerationResult(
         ? `视频已生成，正在重试复制分享链接 ${Math.floor((Date.now() - generatedAt) / 1000)}s`
         : `已提交${siteLabel}，等待生成完成 ${elapsedSeconds}s`);
     }
-    await wait(5000);
+    await wait(GENERATION_POLL_INTERVAL_MS);
   }
 
   if (generatedAt) {
@@ -3331,7 +3435,15 @@ async function findShareIconPoint(win: BrowserWindow) {
   `);
 }
 
-async function clickByKeywords(win: BrowserWindow, keywords: string[]) {
+async function clickByKeywords(win: BrowserWindow, keywords: string[]): Promise<boolean> {
+  // 可信原生点击优先：取命中元素中心做贝塞尔移动 + 鼠标按下/抬起，
+  // 比页面内 el.click()（isTrusted=false 合成点击）更难被风控识别。
+  const point = await findKeywordPoint(win, keywords);
+  if (point) {
+    await sendMouseClick(win, point.x, point.y);
+    return true;
+  }
+  // 坐标拿不到（如控件被父容器盖住）时才回退到页面内合成点击。
   return runPageScript<boolean>(win, `
     (() => {
       const keywords = ${JSON.stringify(keywords.map((item) => item.toLowerCase()))};
@@ -3369,6 +3481,12 @@ async function clickByKeywords(win: BrowserWindow, keywords: string[]) {
 
 /** 按稳定结构属性点击可见控件；找不到或不可见时返回 false，交给调用方回退。 */
 async function clickBySelector(win: BrowserWindow, selector: string): Promise<boolean> {
+  // 可信原生点击优先；坐标拿不到时才回退到页面内合成点击。
+  const point = await findElementCenter(win, selector);
+  if (point) {
+    await sendMouseClick(win, point.x, point.y);
+    return true;
+  }
   return runPageScript<boolean>(win, `
     (() => {
       const el = document.querySelector(${JSON.stringify(selector)});
