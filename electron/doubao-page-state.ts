@@ -307,6 +307,38 @@ export function hasNewPromptOccurrence(currentText: string, baselineText: string
   return count(normalize(currentText)) > count(normalize(baselineText));
 }
 
+/**
+ * 页面是否出现豆包的提交确认回话
+ * （“本次使用 Seedance 2.0 Mini/Fast 生成” + “视频生成好后” + “本次生成将消耗每日免费额度”）。
+ */
+export function hasDoubaoSubmissionConfirmation(pageText: string) {
+  const text = pageText.replace(/\s+/g, " ").trim();
+  return /本次使用\s+Seedance\s*2\.0\s*(?:Mini|Fast)\s+生成/.test(text)
+    && text.includes("视频生成好后")
+    && text.includes("本次生成将消耗每日免费额度");
+}
+
+/**
+ * 提交后是否已有足够证据证明本次提示词确实发出去了。
+ *
+ * 判据（任一）：
+ *  - 页面出现豆包的提交确认回话；
+ *  - 输入框已清空、提示词回显在聊天区（isPromptMovedOutOfComposer）。
+ *
+ * **会话地址是否已从 /chat/local_... 草稿转正不作为判据**：长提示词 + 多张参考图时，
+ * 豆包先回显用户消息、助手开始思考，要过更久才把地址切成正式会话（真机
+ * doubao-cb788c37cbde4f74：截图里提示词已进入聊天区、助手正在思考，地址仍是草稿）。
+ * 按地址判失败会把正在生成的任务掐断并错误地退回额度。
+ */
+export function hasDoubaoSubmissionEvidence(input: {
+  pageText: string;
+  composerText: string;
+  prompt: string;
+}) {
+  return hasDoubaoSubmissionConfirmation(input.pageText)
+    || isPromptMovedOutOfComposer(input);
+}
+
 export function isQuotaNotChargedFailure(message: string) {
   return /额度未扣除|生成额度未扣除|未消耗|未扣费|不会扣除/.test(message);
 }

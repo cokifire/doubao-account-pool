@@ -7,6 +7,8 @@ import {
   extractDoubaoFailureMessage,
   extractDoubaoShareUrl,
   getNewDoubaoVideoUrls,
+  hasDoubaoSubmissionConfirmation,
+  hasDoubaoSubmissionEvidence,
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
@@ -331,6 +333,58 @@ test('detects when the prompt moved from composer into the chat', () => {
     }),
     true
   )
+})
+
+test('keeps a long-prompt submission alive while the conversation URL is still a draft', () => {
+  // 真机现场（doubao-cb788c37cbde4f74）：长提示词 + 3 张参考图提交后，页面已把提示词
+  // 回显到聊天区、助手正在思考，但地址仍停在 /chat/local_... 草稿，也没有提交确认回话。
+  const prompt = '生成视频：[风格] 历史建筑纪录片式照片动画，真实保留三张香港中银大厦施工历史照片的胶片质感'
+  const pageText = [
+    '新对话',
+    '生成视频：[风格] 历史建筑纪录片式照片动画，真实保留三张香港中银大厦施工历史照片的胶片质感',
+    '展开全部',
+    '视频生成 模型 Seedance 2.0 Mini 自动 · 10s',
+  ].join(' ')
+
+  // 输入框已清空（占位文案）→ 消息确实发出，不能因为地址没转正就判失败。
+  assert.equal(
+    hasDoubaoSubmissionEvidence({ pageText, composerText: '描述你想要的视频', prompt }),
+    true
+  )
+  // 输入框里还留着提示词（没发出去）→ 不算已提交。
+  assert.equal(
+    hasDoubaoSubmissionEvidence({ pageText, composerText: prompt, prompt }),
+    false
+  )
+  // 输入框清空但页面里也找不到提示词（内容被编辑器丢弃）→ 不算已提交。
+  assert.equal(
+    hasDoubaoSubmissionEvidence({ pageText: '新对话 视频生成 模型 Seedance 2.0 Mini', composerText: '', prompt }),
+    false
+  )
+  // 豆包已经回了提交确认文案 → 即使提示词被站点改写也能确认已提交。
+  assert.equal(
+    hasDoubaoSubmissionEvidence({
+      pageText: '本次使用 Seedance 2.0 Mini 生成，预计等待 20 分钟。视频生成好后，我会主动发送给你。本次生成将消耗每日免费额度。',
+      composerText: '',
+      prompt,
+    }),
+    true
+  )
+})
+
+test('recognizes the Doubao submission confirmation reply', () => {
+  assert.equal(
+    hasDoubaoSubmissionConfirmation(
+      '本次使用 Seedance 2.0 Fast 生成，预计等待 20 分钟。视频生成好后，我会主动发送给你。本次生成将消耗每日免费额度。'
+    ),
+    true
+  )
+  // 只有提交文案、没有额度说明（例如历史上的提交快照）不算确认回话。
+  assert.equal(
+    hasDoubaoSubmissionConfirmation('视频生成已提交，视频生成好后会通知你。'),
+    false
+  )
+  assert.equal(hasDoubaoSubmissionConfirmation(''), false)
 })
 
 test('does not treat prompt rewrite pages as generated videos', () => {

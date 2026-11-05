@@ -12,6 +12,8 @@ import {
   extractDoubaoFailureMessage,
   extractDoubaoShareUrl,
   getNewDoubaoVideoUrls,
+  hasDoubaoSubmissionConfirmation,
+  hasDoubaoSubmissionEvidence,
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
@@ -459,16 +461,24 @@ export class DoubaoExecutor {
           message: `已记录本次${siteLabel}会话地址，等待视频完成`,
           doubaoThreadUrl: submittedConversationUrl
         });
-      } else if (!(await isSubmissionConfirmedOnPage(win))) {
-        // 提交后未等到正式会话地址，且页面也没有出现提交确认文案，
-        // 说明本次任务根本没有在站点创建对话（提示词未真正发送成功）。
-        // 此时不设置 submittedToDoubao，任务快速失败并退还额度。
+      } else if (await hasSubmissionEvidenceOnPage(win, request.prompt)) {
+        // 会话地址还没转正（仍是 /chat/local_... 草稿）不代表没发出去：
+        // 长提示词 + 多张参考图时，豆包会先把消息回显到聊天区、助手进入思考，
+        // 过更久才切成正式会话。只要聊天区已有本次提示词，就认定已提交并继续等待，
+        // 否则会把正在生成的任务掐断、还错误地退回额度（doubao-cb788c37cbde4f74）。
+        submittedToDoubao = true;
+        await this.updateProgress({
+          requestId,
+          status: "running",
+          message: `已提交${siteLabel}（会话地址尚未转正），等待视频完成`
+        });
+      } else {
+        // 聊天区里找不到本次提示词（输入框已清空也没回显），说明提示词没真正发出，
+        // 任务快速失败并退还额度，避免空等到生成超时。
         throw new DoubaoPageFailureError(
           `提交${siteLabel}后未检测到正式会话地址，${siteLabel}未真正创建本次对话，可能提示词未发送成功`,
           "submission_failed"
         );
-      } else {
-        submittedToDoubao = true;
       }
 
       await this.updateProgress({
@@ -2104,17 +2114,33 @@ async function waitForSubmissionStarted(
 }
 
 /**
- * 兜底判定：当提交后未等到正式会话地址时，检查当前页面是否已出现
- * “本次使用 Seedance 2.0 Mini/Fast 生成 + 视频生成好后 + 本次生成将消耗每日免费额度”
- * 的提交确认文案。若存在说明提示词确实发送成功了（只是会话地址未及时切换）。
+ * 兜底判定：当提交后未等到正式会话地址时，检查页面是否已有“提示词确实发出去了”的证据。
+ * 证据见 hasDoubaoSubmissionEvidence：豆包的提交确认回话，
+ * 或输入框已清空且提示词回显在聊天区（长提示词 + 多参考图时地址转正会明显滞后）。
  */
-async function isSubmissionConfirmedOnPage(win: BrowserWindow) {
+async function hasSubmissionEvidenceOnPage(win: BrowserWindow, prompt: string) {
   return runPageScript<boolean>(win, `
     (() => {
-      const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
-      return /本次使用\\s+Seedance\\s*2\\.0\\s*(?:Mini|Fast)\\s+生成/.test(pageText)
-        && pageText.includes("视频生成好后")
-        && pageText.includes("本次生成将消耗每日免费额度");
+      const hasDoubaoSubmissionConfirmation = ${hasDoubaoSubmissionConfirmation.toString()};
+      const isPromptMovedOutOfComposer = ${isPromptMovedOutOfComposer.toString()};
+      const hasDoubaoSubmissionEvidence = ${hasDoubaoSubmissionEvidence.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const editables = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input[type="text"]'))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+        .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const editor = editables[0];
+      const composerText = editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement
+        ? editor.value
+        : (editor?.innerText || editor?.textContent || "");
+      return hasDoubaoSubmissionEvidence({
+        pageText: document.body?.innerText || "",
+        composerText,
+        prompt: ${JSON.stringify(prompt)}
+      });
     })()
   `);
 }
@@ -3361,13 +3387,24 @@ async function findOverflowMenuPoint(win: BrowserWindow) {
 }
 
 /**
+ * 等待会话地址从 /chat/local_... 草稿转正的时长。长提示词 + 多参考图时豆包建立
+ * 正式会话明显更慢（真机曾在草稿状态停留超过 8 秒），这里按慢场景放宽。
+ */
+const SUBMITTED_CONVERSATION_URL_TIMEOUT_MS = 25000;
+
+/**
  * 等待本次提交落到（或新建出）的正式会话地址。
  * 提示词真正发送成功后，豆包会把 /chat/local_... 本地草稿地址切换为服务端正式会话地址。
  * 但若打开账号时正停在前一次任务的旧会话上（失败任务残留的常见状态），初始地址就已经是
  * 正式会话，不能立刻认定它就是本次会话——本次提交很可能另行创建了新会话。
  * 因此要等地址稳定一小段时间，并在地址变化时采用变化后的新地址。
+ *
+ * 超时也不会被当成提交失败：调用方改用页面证据（提示词是否已进入聊天区）判定。
  */
-async function waitForSubmittedConversationUrl(win: BrowserWindow, timeoutMs = 8000) {
+async function waitForSubmittedConversationUrl(
+  win: BrowserWindow,
+  timeoutMs = SUBMITTED_CONVERSATION_URL_TIMEOUT_MS
+) {
   let conversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
   let stableSince = Date.now();
   const startedAt = Date.now();
