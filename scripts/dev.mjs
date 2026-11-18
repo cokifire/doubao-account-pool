@@ -15,9 +15,18 @@ if (process.platform === "win32") {
   }
 }
 
+// `npm run dev -- --show-window` 只会把参数传给本脚本，不会自动透传到 electron 子进程。
+// 这里转成环境变量交给 npm-run-all 的子进程，避免把 electron 专有参数塞给 vite。
+// 用户也可以直接在终端设置 DOUBAO_SHOW_WINDOW=1，spawn 默认继承环境变量。
+const showWindow = process.argv.slice(2).includes("--show-window");
+const childEnv = showWindow
+  ? { ...process.env, DOUBAO_SHOW_WINDOW: "1" }
+  : process.env;
+
 const child = spawn("npm-run-all", ["-p", "dev:renderer", "dev:electron"], {
   stdio: "inherit",
-  shell: process.platform === "win32"
+  shell: process.platform === "win32",
+  env: childEnv
 });
 
 child.on("error", (error) => {

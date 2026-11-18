@@ -28,9 +28,35 @@
 
 macOS 应用已进行完整 ad-hoc 签名，避免因 Electron 临时签名不完整而显示“应用已损坏”。当前安装包尚未使用 Apple Developer ID 公证或 Windows 商业代码签名，Gatekeeper 或 SmartScreen 首次运行时仍可能显示来源提示。请核对发布页中的 SHA-256；macOS 首次尝试打开后，可进入“系统设置 > 隐私与安全性”，在安全性区域选择“仍要打开”。
 
+## 启动与后台运行
+
+应用启动后**默认不显示 Electron 主窗口**，静默在后台常驻：本地 API 服务（默认 `127.0.0.1:17888`）、每日额度重置和后台任务执行全部照常工作。需要打开界面添加账号、查看日志或修改配置时，用启动参数显式显示：
+
+```bash
+# 源码模式
+npm run dev --show-window
+
+# Windows PowerShell（等价的环境变量写法）
+$env:DOUBAO_SHOW_WINDOW = "1"
+npm run dev
+
+# Windows 安装包
+"豆包账号池接口服务.exe" --show-window
+
+# macOS 应用包
+open -a "豆包账号池接口服务" --args --show-window
+```
+
+- `--show-window` 与环境变量 `DOUBAO_SHOW_WINDOW=1`（或 `true`）作用相同，任一命中即显示主窗口。
+- 显示界面后点击关闭按钮即正常退出，接口服务与后台任务随之停止。
+- 后台模式下没有窗口可关闭，用 `Ctrl+C`（源码模式）或任务管理器结束进程。
+- 已有后台实例时，带 `--show-window` 再启动一次会唤起该实例的界面；不带参数的重复启动保持静默。源码模式下参数经环境变量转发，无法传给已运行的实例，需先 `Ctrl+C` 停止再带参数启动。
+
+日常作为接口服务使用时保持默认后台启动即可，不必显示界面。
+
 ## 快速开始
 
-1. 安装并启动应用。
+1. 安装后按上面「启动与后台运行」的说明带 `--show-window` 启动以打开界面；日常仅作为接口服务使用时直接启动即可。
 2. 点击“添加账号”，在打开的独立豆包窗口中完成登录。
 3. 返回账号池执行检测，确认账号显示为“已登录”和“空闲”。
 4. 在“配置管理”中设置 API Key、模型额度、执行策略、去水印 Token 和输出目录。
@@ -110,6 +136,7 @@ npm run typecheck  # TypeScript 检查
 npm run build      # 生产构建
 npm run dist       # macOS 安装包
 npm run dist:win   # Windows x64 安装包
+npm run dev -- --show-window  # 源码模式启动并显示主界面
 ```
 
 ## 技术栈

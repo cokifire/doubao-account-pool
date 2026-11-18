@@ -78,6 +78,12 @@ if (isDev) {
   process.env.VITE_DEV_SERVER_URL = probedUrl!;
 }
 
+// 默认后台运行：主窗口照常创建但不显示，本地 API、额度重置与后台任务执行不受影响。
+// 需要打开界面做配置或调试时，显式传 --show-window 或设置 DOUBAO_SHOW_WINDOW=1/true。
+const SHOW_WINDOW_FLAG = "--show-window";
+const envShowWindow = ["1", "true"].includes((process.env.DOUBAO_SHOW_WINDOW ?? "").trim().toLowerCase());
+const showWindowAtStartup = envShowWindow || process.argv.includes(SHOW_WINDOW_FLAG);
+
 class LocalApiServer {
   private server: Server | null = null;
   private status: ApiServerStatus = {
@@ -349,12 +355,14 @@ class LocalApiServer {
   }
 }
 
-function createMainWindow() {
+function createMainWindow(show = showWindowAtStartup) {
   mainWindow = new BrowserWindow({
     width: 1298,
     height: 760,
     minWidth: 980,
     minHeight: 640,
+    // 构造时就设为隐藏，避免启动瞬间闪一下窗口。
+    show,
     title: "豆包账号池接口服务",
     webPreferences: {
       preload: path.join(__dirname, "preload/preload.cjs"),
@@ -962,7 +970,9 @@ const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, argv) => {
+    // 后台模式下不带参数的重复启动保持静默，只有显式要求显示界面才唤起窗口。
+    if (!argv.includes(SHOW_WINDOW_FLAG)) return;
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
@@ -976,6 +986,11 @@ if (!hasSingleInstanceLock) {
     apiServer = new LocalApiServer(db, executor);
     registerIpc();
     await apiServer.applySettings(db.getSettings());
+    log.info(
+      showWindowAtStartup
+        ? "启动参数指定显示主界面"
+        : "默认后台启动：主界面保持隐藏，本地服务与后台任务照常运行"
+    );
     createMainWindow();
 
     // 启动卡死任务巡视：自动结束超过 30 分钟无返回数据的 running 任务，
@@ -999,7 +1014,8 @@ if (!hasSingleInstanceLock) {
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) {
-        createMainWindow();
+        // macOS 点击 Dock 重建窗口属于用户主动请求，直接显示可见界面。
+        createMainWindow(true);
       }
     });
   }).catch((error) => {
